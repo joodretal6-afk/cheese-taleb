@@ -64,7 +64,7 @@ export const PICKUP_SPEC: VehicleSpec = {
   centreOfMassY: -0.34,
   suspensionRestLength: 0.46,
   suspensionStiffness: 46000,
-  suspensionDamping: 4200,
+  suspensionDamping: 2900,
   suspensionMaxTravel: 0.26,
   enginePower: 18000,
   brakeTorque: 12000,
@@ -337,7 +337,21 @@ export class Vehicle {
       const vmz = linvel.z + (angvel.x * rmy - angvel.y * rmx)
       const compressionVelocity = vmx * downX + vmy * downY + vmz * downZ
 
-      const damperForce = spec.suspensionDamping * compressionVelocity
+      // The damper is bounded on its own, not just as part of the total.
+      //
+      // Driving over uneven ground feeds a compression velocity every time a
+      // wheel meets a rise, and an unbounded damper turns each of those into a
+      // large upward impulse. Across continuous bumps those impulses pump the
+      // chassis upward: it rides high, the tyres carry less than their share of
+      // the weight, and traction drops — which reads as the truck floating and
+      // refusing to accelerate. Bounding the damper stops the pumping while
+      // leaving it free to do its actual job of settling the spring.
+      const staticCornerLoad = (spec.mass * 9.81) / spec.wheels.length
+      const damperForce = clamp(
+        spec.suspensionDamping * compressionVelocity,
+        -staticCornerLoad * 1.5,
+        staticCornerLoad * 1.5,
+      )
       // Springs push, never pull.
       let suspensionForce = Math.max(0, springForce + damperForce)
 
@@ -348,11 +362,8 @@ export class Vehicle {
         suspensionForce += overshoot * spec.suspensionStiffness * 8
       }
 
-      // Backstop against a bad landing turning into a launch. Six times the
-      // static corner load is far more than real suspension delivers, so this
-      // never shapes normal driving — it only bounds the pathological case.
-      const staticCornerLoad = (spec.mass * 9.81) / spec.wheels.length
-      suspensionForce = Math.min(suspensionForce, staticCornerLoad * 6)
+      // Backstop against a bad landing turning into a launch.
+      suspensionForce = Math.min(suspensionForce, staticCornerLoad * 3.2)
 
       wheel.load = suspensionForce
 
@@ -442,12 +453,18 @@ export class Vehicle {
       wheel.slipAngle = Math.atan2(vLateral, Math.abs(vForward) + 0.9)
       // Linear near zero, saturating past the peak — a cheap Pacejka stand-in.
       const lateralResponse = Math.sin(clamp(wheel.slipAngle * 2.6, -Math.PI / 2, Math.PI / 2))
-      let lateral = -lateralResponse * wheel.load * grip
+      // Driven wheels hold less sideways than the steered pair, so the back
+      // steps out before the front washes wide — the balance a car needs to be
+      // slidable rather than merely loose. The handbrake drops it further and
+      // is what actually breaks traction on command.
+      let lateralGrip = grip * (wheel.config.driven ? 0.72 : 1)
+      if (controls.handbrake && wheel.config.handbrake) lateralGrip *= 0.34
+      let lateral = -lateralResponse * wheel.load * lateralGrip
 
       // --- Friction circle --------------------------------------------------
       // The tyre has one budget shared between turning and driving; exceed it
       // and it breaks away, which is what lets the truck slide in the wet.
-      const maxForce = wheel.load * grip
+      const maxForce = wheel.load * Math.max(grip, lateralGrip)
       const total = Math.hypot(longitudinal, lateral)
       if (total > maxForce && total > 1e-3) {
         const scale = maxForce / total

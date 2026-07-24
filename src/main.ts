@@ -61,9 +61,9 @@ async function boot(): Promise<void> {
     .loadSurfaceDetail('./textures/ground-normal.png', './textures/ground-ao.png')
     .catch((error: unknown) => console.warn('surface detail unavailable:', error))
 
-  // Spawn on flat-ish ground near the middle, facing across the arena.
+  // Spawn on the road, pointing along it.
   const spawnX = TERRAIN_SIZE * 0.5
-  const spawnZ = TERRAIN_SIZE * 0.32
+  const spawnZ = TERRAIN_SIZE * 0.42
   const vehicle = new Vehicle(
     RAPIER,
     world,

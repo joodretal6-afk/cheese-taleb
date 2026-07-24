@@ -94,6 +94,7 @@ export class TerrainMesh {
       shader.uniforms.churnMap = { value: this.churnTexture }
       shader.uniforms.wetColour = { value: new THREE.Color(0x33261a) }
       shader.uniforms.dryColour = { value: new THREE.Color(0x8a7255) }
+      shader.uniforms.roadColour = { value: new THREE.Color(0x3a3b3d) }
       shader.uniforms.detailNormalMap = { value: this.detailNormalTexture }
       shader.uniforms.detailAoMap = { value: this.detailAoTexture }
       shader.uniforms.detailRepeat = { value: DETAIL_REPEAT }
@@ -137,6 +138,7 @@ export class TerrainMesh {
            uniform float hasDetail;
            uniform vec3 wetColour;
            uniform vec3 dryColour;
+           uniform vec3 roadColour;
            varying vec2 vTerrainUv;
            varying vec3 vTerrainTangent;
            varying vec3 vTerrainBitangent;`,
@@ -148,15 +150,21 @@ export class TerrainMesh {
            // Ambient occlusion from the surface material darkens the cracks.
            // Applied to albedo rather than through aoMap, which would need a
            // second UV set this mesh does not carry.
-           float detailAo = mix(1.0, texture2D(detailAoMap, detailUv).r, hasDetail);
+           float roadFade = 1.0 - texture2D(churnMap, vTerrainUv).b;
+           float detailAo = mix(1.0, texture2D(detailAoMap, detailUv).r, hasDetail * roadFade);
            diffuseColor.rgb *= mix(1.0, detailAo, 0.95);
-           vec2 churnSample = texture2D(churnMap, vTerrainUv).rg;
-           float churn = churnSample.r;
-           float wetness = churnSample.g;
+           vec3 churnSample = texture2D(churnMap, vTerrainUv).rgb;
+           float road = churnSample.b;
+           // Tarmac neither churns nor holds water.
+           float churn = churnSample.r * (1.0 - road);
+           float wetness = churnSample.g * (1.0 - road);
            // Undisturbed ground drifts toward the dry tone; churned mud toward
            // the wet one, so ruts darken as they are cut.
            vec3 groundTint = mix(dryColour, wetColour, clamp(wetness * 0.55 + churn * 0.75, 0.0, 1.0));
-           diffuseColor.rgb *= groundTint * 1.9;`,
+           diffuseColor.rgb *= groundTint * 1.9;
+           // Asphalt over the top, with the surface detail faded out so the
+           // road does not inherit the cracked-earth relief.
+           diffuseColor.rgb = mix(diffuseColor.rgb, roadColour, road);`,
         )
         .replace(
           '#include <roughnessmap_fragment>',
@@ -174,7 +182,8 @@ export class TerrainMesh {
            // whose internals move between versions.
            vec3 detailN = texture2D(detailNormalMap, detailUv).xyz * 2.0 - 1.0;
            vec3 detailPerturb = vTerrainTangent * detailN.x + vTerrainBitangent * detailN.y;
-           normal = normalize(normal + detailPerturb * detailStrength * hasDetail);`,
+           float roadSmooth = 1.0 - texture2D(churnMap, vTerrainUv).b;
+           normal = normalize(normal + detailPerturb * detailStrength * hasDetail * roadSmooth);`,
         )
     }
     // Injected uniforms change the program signature, so give it its own key.
@@ -282,7 +291,9 @@ export class TerrainMesh {
 
         this.churnData[o] = Math.round(Math.min(1, surface[index * 2]!) * 255)
         this.churnData[o + 1] = Math.round(Math.min(1, surface[index * 2 + 1]!) * 255)
-        this.churnData[o + 2] = 0
+        // Blue channel is otherwise unused, so the road mask travels for free
+        // rather than costing a fourth full-resolution texture.
+        this.churnData[o + 2] = Math.round(this.terrain.roadMask[index]! * 255)
         this.churnData[o + 3] = 255
       }
     }

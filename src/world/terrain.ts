@@ -16,13 +16,26 @@ import { Rng, clamp } from '../engine/math'
  */
 
 /** Arena is a square this many metres on a side. */
-export const TERRAIN_SIZE = 50
+export const TERRAIN_SIZE = 1000
 
-/** Height samples per axis — 50m / 512 ≈ 9.8cm between samples. */
-export const HEIGHT_RES = 512
+/**
+ * Height samples per axis — 1km / 1024 ≈ 98cm between samples.
+ *
+ * This is the cost of the larger arena. At 50m the grid resolved a tyre's
+ * contact patch, so ruts were cut at their true width; at 1km one sample is
+ * wider than a tyre, and tracks are necessarily coarser. Going finer is a
+ * memory cliff: every doubling quadruples four full-grid arrays. The real fix
+ * is a high-resolution patch that follows the truck rather than a uniformly
+ * fine grid over ground nobody is standing on.
+ */
+export const HEIGHT_RES = 1024
 
-/** Drawn vertices per axis. */
-export const MESH_RES = 256
+/**
+ * Drawn vertices per axis. Held well below HEIGHT_RES so the triangle count
+ * stays inside a phone's budget; the normal map carries the detail the
+ * geometry drops.
+ */
+export const MESH_RES = 320
 
 const HEIGHT_STEP = TERRAIN_SIZE / (HEIGHT_RES - 1)
 
@@ -36,6 +49,10 @@ const HEIGHT_STEP = TERRAIN_SIZE / (HEIGHT_RES - 1)
  * why adding grip made it worse rather than better.
  */
 const MAX_RUT_DEPTH = 0.06
+
+/** Carriageway width in metres, plus the graded shoulder either side. */
+const ROAD_WIDTH = 14
+const ROAD_SHOULDER = 5
 
 /** Channels in the surface texture the ground shader reads. */
 export interface SurfaceSample {
@@ -61,6 +78,9 @@ export class Terrain {
    */
   readonly surface: Float32Array
 
+  /** 1 where the road runs, feathered to 0 across its shoulder. */
+  readonly roadMask: Float32Array
+
   /** Marks the sub-rectangle changed since the last upload, to avoid full re-uploads. */
   private dirtyMinX = Infinity
   private dirtyMinY = Infinity
@@ -72,6 +92,7 @@ export class Terrain {
     this.heights = new Float32Array(count)
     this.restHeights = new Float32Array(count)
     this.surface = new Float32Array(count * 2)
+    this.roadMask = new Float32Array(count)
     this.generate(seed)
   }
 
@@ -117,7 +138,71 @@ export class Terrain {
         this.surface[index * 2 + 1] = wetness
       }
     }
+
+    this.carveRoad()
     this.markAllDirty()
+  }
+
+  /**
+   * Lays a road down the middle of the arena.
+   *
+   * The road earns its place by contrast: it is flat, dry and grippy, so it is
+   * the fast line across a map that otherwise fights the truck. Its edges are
+   * feathered rather than cut, which keeps a wheel from catching a step when it
+   * drifts off the tarmac.
+   */
+  private carveRoad(): void {
+    const centre = TERRAIN_SIZE / 2
+    const halfWidth = ROAD_WIDTH / 2
+    const shoulder = halfWidth + ROAD_SHOULDER
+
+    for (let y = 0; y < HEIGHT_RES; y++) {
+      for (let x = 0; x < HEIGHT_RES; x++) {
+        const worldX = x * HEIGHT_STEP
+        const distance = Math.abs(worldX - centre)
+        if (distance > shoulder) continue
+
+        const index = y * HEIGHT_RES + x
+        // 1 on the carriageway, easing to 0 across the shoulder.
+        const t =
+          distance <= halfWidth
+            ? 1
+            : 1 - smoothstep((distance - halfWidth) / ROAD_SHOULDER)
+
+        // Flatten toward the road's own longitudinal profile rather than to a
+        // constant height, so it follows the land instead of cutting a trench.
+        const target = this.roadHeightAt(y)
+        const flattened = this.heights[index]! + (target - this.heights[index]!) * t
+        this.heights[index] = flattened
+        this.restHeights[index] = flattened
+
+        // Tarmac is dry and does not churn.
+        this.surface[index * 2 + 1] = this.surface[index * 2 + 1]! * (1 - t)
+        this.roadMask[index] = t
+      }
+    }
+  }
+
+  /** Smoothed centreline height, so the road reads as graded. */
+  private roadHeightAt(gridY: number): number {
+    const centreX = Math.round(TERRAIN_SIZE / 2 / HEIGHT_STEP)
+    let sum = 0
+    let count = 0
+    // Average along the road's length as well as across it: a road that
+    // inherited every bump of the terrain would not look built.
+    for (let dy = -12; dy <= 12; dy += 4) {
+      const y = Math.min(HEIGHT_RES - 1, Math.max(0, gridY + dy))
+      sum += this.restHeights[y * HEIGHT_RES + centreX]!
+      count++
+    }
+    return sum / count
+  }
+
+  /** 1 on the road surface, 0 on open ground. */
+  roadAt(worldX: number, worldZ: number): number {
+    const gx = Math.round(clamp(worldX / HEIGHT_STEP, 0, HEIGHT_RES - 1))
+    const gy = Math.round(clamp(worldZ / HEIGHT_STEP, 0, HEIGHT_RES - 1))
+    return this.roadMask[gy * HEIGHT_RES + gx]!
   }
 
   /** Presses a bump into the ground — used to seat stones into the surface. */
@@ -133,7 +218,12 @@ export class Terrain {
    * patch, which is what makes ruts read as ruts rather than as dents.
    */
   deform(worldX: number, worldZ: number, radius: number, depth: number, churn = 1): void {
-    const lipRadius = radius * 1.7
+    // A contact patch narrower than one grid sample would land between samples
+    // and leave nothing behind. Widening to the grid keeps a track visible —
+    // wider than the real tyre, but present rather than absent.
+    const effectiveRadius = Math.max(radius, HEIGHT_STEP * 1.4)
+    const lipRadius = effectiveRadius * 1.7
+    radius = effectiveRadius
     this.stamp(worldX, worldZ, lipRadius, (falloff, index, distance) => {
       if (distance <= radius) {
         const t = 1 - distance / radius
@@ -286,6 +376,8 @@ function valueNoise(x: number, y: number): number {
   const n11 = latticeValue(x0 + 1, y0 + 1)
   return (n00 * (1 - ux) + n10 * ux) * (1 - uy) + (n01 * (1 - ux) + n11 * ux) * uy
 }
+
+const smoothstep = (t: number): number => t * t * (3 - 2 * t)
 
 function latticeValue(x: number, y: number): number {
   let h = Math.imul(x, 374761393) ^ Math.imul(y, 668265263)
