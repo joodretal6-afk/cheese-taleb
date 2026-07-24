@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "android:sync": "npm run build && npx cap sync android",
     "android:aab": "npm run android:sync && cd android && ./gradlew bundleRelease",
-    "android:apk": "npm run android:sync && cd android && ./gradlew assembleDebug"
+    "android:apk": "npm run android:sync && cd android && ./gradlew assembleDebug",
+    "editor:standalone": "vite build --config vite.editor.config.ts && node tools/pack-editor.mjs"
   },
   "devDependencies": {
     "@capacitor/android": "^7.0.0",

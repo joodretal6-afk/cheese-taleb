@@ -8,3 +8,4 @@ android/app/src/main/assets/public/
 *.apk
 *.aab
 .DS_Store
+dist-editor/
