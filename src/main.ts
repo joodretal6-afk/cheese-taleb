@@ -8,6 +8,7 @@ import { TerrainMesh } from './world/terrain-mesh'
 import { createBoundaryWalls, createScene, scatterRocks } from './world/scene'
 import { PICKUP_SPEC, Vehicle, rotateVector } from './vehicle/vehicle'
 import { buildTruck } from './vehicle/truck-mesh'
+import { loadTruckModel } from './vehicle/truck-model'
 import { createControls } from './ui/controls'
 import { createHud } from './ui/hud'
 
@@ -65,7 +66,19 @@ async function boot(): Promise<void> {
     0,
   )
 
-  const truck = buildTruck()
+  // Prefer the authored model; fall back to the parametric one so a missing or
+  // broken asset degrades to a playable truck instead of a black screen.
+  let truck
+  try {
+    truck = await loadTruckModel('./models/truck.glb', {
+      // This asset is authored nose-toward -Z; the game drives toward +Z.
+      headingOffset: Math.PI,
+    })
+    console.info(`model loaded: ${truck.triangleCount} triangles`)
+  } catch (error) {
+    console.warn('falling back to the parametric truck:', error)
+    truck = buildTruck()
+  }
   scene.add(truck.group)
 
   const controls = createControls(app)
