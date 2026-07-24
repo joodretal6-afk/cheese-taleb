@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Zone Royale</string>
+    <string name="title_activity_main">Zone Royale</string>
+    <string name="package_name">com.zoneroyale.mudrunner</string>
+    <string name="custom_url_scheme">com.zoneroyale.mudrunner</string>
+</resources>

@@ -1,0 +1,12 @@
+{
+  "appId": "com.zoneroyale.mudrunner",
+  "appName": "Zone Royale",
+  "webDir": "dist",
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#0d1117"
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}
