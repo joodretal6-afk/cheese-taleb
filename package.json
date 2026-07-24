@@ -1,0 +1,26 @@
+{
+  "name": "zone-royale",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Zone Royale - a top-down battle royale for mobile, played on real-world maps",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host",
+    "typecheck": "tsc --noEmit",
+    "map:fetch": "node tools/fetch-map.mjs",
+    "android:sync": "npm run build && npx cap sync android",
+    "android:aab": "npm run android:sync && cd android && ./gradlew bundleRelease",
+    "android:apk": "npm run android:sync && cd android && ./gradlew assembleDebug"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^7.0.0",
+    "@capacitor/cli": "^7.0.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5"
+  },
+  "dependencies": {
+    "@capacitor/core": "^7.0.0"
+  }
+}

@@ -1,0 +1,19 @@
+node_modules/
+dist/
+.vite/
+
+# Android build output
+android/app/build/
+android/build/
+android/.gradle/
+android/local.properties
+android/app/release/
+*.keystore
+*.jks
+keystore.properties
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.log
