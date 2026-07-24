@@ -72,7 +72,7 @@ export const PICKUP_SPEC: VehicleSpec = {
   maxSteerAngle: 0.62,
   steerSpeedFalloff: 0.055,
   topSpeed: 42,
-  tyreGrip: 1.45,
+  tyreGrip: 1.6,
   rollingResistance: 11,
   dragCoefficient: 2.6,
   downforce: 8,
@@ -372,7 +372,7 @@ export class Vehicle {
       const churn = this.surfaceSample.churn
       const wetness = this.surfaceSample.wetness
       // Wet, churned mud is slick; packed dry ground bites.
-      const gripScale = 1 - churn * 0.2 - wetness * 0.26
+      const gripScale = 1 - churn * 0.16 - wetness * 0.18
       const grip = spec.tyreGrip * clamp(gripScale, 0.32, 1)
       wheel.sinkDepth = churn * 0.09 + wetness * 0.03
 

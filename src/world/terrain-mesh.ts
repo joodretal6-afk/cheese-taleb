@@ -17,6 +17,14 @@ import { HEIGHT_RES, MESH_RES, TERRAIN_SIZE, type Terrain } from './terrain'
 /** Re-uploading the detail textures is the expensive part, so it is rate limited. */
 const TEXTURE_UPDATE_INTERVAL = 0.09
 
+/**
+ * How many times the surface material repeats across the arena. At 50m this
+ * puts one tile every ~5.5m. Tiling it more finely made the cracks too small
+ * to register from the chase camera — the detail was present but invisible,
+ * which is the same as absent.
+ */
+const DETAIL_REPEAT = 9
+
 export class TerrainMesh {
   readonly mesh: THREE.Mesh
   readonly material: THREE.MeshStandardMaterial
@@ -32,6 +40,11 @@ export class TerrainMesh {
 
   private pendingTextureRefresh = false
   private timeSinceUpload = 0
+
+  /** Surface material supplied by the artist; null until it finishes loading. */
+  private detailNormalTexture: THREE.Texture | null = null
+  private detailAoTexture: THREE.Texture | null = null
+  private detailUniforms: Record<string, { value: unknown }> | null = null
 
   constructor(terrain: Terrain) {
     this.terrain = terrain
@@ -81,26 +94,62 @@ export class TerrainMesh {
       shader.uniforms.churnMap = { value: this.churnTexture }
       shader.uniforms.wetColour = { value: new THREE.Color(0x33261a) }
       shader.uniforms.dryColour = { value: new THREE.Color(0x8a7255) }
+      shader.uniforms.detailNormalMap = { value: this.detailNormalTexture }
+      shader.uniforms.detailAoMap = { value: this.detailAoTexture }
+      shader.uniforms.detailRepeat = { value: DETAIL_REPEAT }
+      shader.uniforms.detailStrength = { value: 1.9 }
+      shader.uniforms.hasDetail = { value: this.detailNormalTexture ? 1 : 0 }
+      // Held so a later load can switch the detail on without recompiling.
+      this.detailUniforms = shader.uniforms as unknown as Record<string, { value: unknown }>
 
       // Three.js only emits a UV varying for the texture slots actually bound,
       // and their names shift between versions. Carrying our own removes that
       // coupling entirely.
       shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', `#include <common>\n           varying vec2 vTerrainUv;`)
-        .replace('#include <uv_vertex>', `#include <uv_vertex>\n           vTerrainUv = uv;`)
+        .replace(
+          '#include <common>',
+          `#include <common>
+           varying vec2 vTerrainUv;
+           varying vec3 vTerrainTangent;
+           varying vec3 vTerrainBitangent;`,
+        )
+        .replace(
+          '#include <uv_vertex>',
+          `#include <uv_vertex>
+           vTerrainUv = uv;
+           // Fragment normals live in view space, so the detail perturbation
+           // has to arrive there too. The terrain's UVs run along world X and
+           // Z, which makes its tangent frame axis-aligned and cheap to carry
+           // across: rotate those two axes by the normal matrix here.
+           vTerrainTangent = normalize(normalMatrix * vec3(1.0, 0.0, 0.0));
+           vTerrainBitangent = normalize(normalMatrix * vec3(0.0, 0.0, 1.0));`,
+        )
 
       shader.fragmentShader = shader.fragmentShader
         .replace(
           '#include <common>',
           `#include <common>
            uniform sampler2D churnMap;
+           uniform sampler2D detailNormalMap;
+           uniform sampler2D detailAoMap;
+           uniform float detailRepeat;
+           uniform float detailStrength;
+           uniform float hasDetail;
            uniform vec3 wetColour;
            uniform vec3 dryColour;
-           varying vec2 vTerrainUv;`,
+           varying vec2 vTerrainUv;
+           varying vec3 vTerrainTangent;
+           varying vec3 vTerrainBitangent;`,
         )
         .replace(
           '#include <map_fragment>',
           `#include <map_fragment>
+           vec2 detailUv = vTerrainUv * detailRepeat;
+           // Ambient occlusion from the surface material darkens the cracks.
+           // Applied to albedo rather than through aoMap, which would need a
+           // second UV set this mesh does not carry.
+           float detailAo = mix(1.0, texture2D(detailAoMap, detailUv).r, hasDetail);
+           diffuseColor.rgb *= mix(1.0, detailAo, 0.95);
            vec2 churnSample = texture2D(churnMap, vTerrainUv).rg;
            float churn = churnSample.r;
            float wetness = churnSample.g;
@@ -115,10 +164,53 @@ export class TerrainMesh {
            // Wet mud is glossy; dry packed dirt is not.
            roughnessFactor *= 1.0 - clamp(wetness * 0.45 + churn * 0.35, 0.0, 0.72);`,
         )
+        .replace(
+          '#include <normal_fragment_maps>',
+          `#include <normal_fragment_maps>
+           // Two scales of relief have to coexist: the height field's normal
+           // map carries the ruts the wheels cut, and this one carries the
+           // material's own cracking. Perturbing the already-computed normal
+           // keeps both, and avoids reimplementing three.js' tangent frame —
+           // whose internals move between versions.
+           vec3 detailN = texture2D(detailNormalMap, detailUv).xyz * 2.0 - 1.0;
+           vec3 detailPerturb = vTerrainTangent * detailN.x + vTerrainBitangent * detailN.y;
+           normal = normalize(normal + detailPerturb * detailStrength * hasDetail);`,
+        )
     }
     // Injected uniforms change the program signature, so give it its own key.
     material.customProgramCacheKey = () => 'mud-terrain'
     return material
+  }
+
+  /**
+   * Binds the surface material's detail maps.
+   *
+   * Loading is asynchronous and the terrain must be drawable before it
+   * finishes, so the shader is compiled with the detail contribution switched
+   * off by `hasDetail` and the flag is raised once the images arrive. Compiling
+   * a second program later would stall the frame the truck first touches it.
+   */
+  async loadSurfaceDetail(normalUrl: string, aoUrl: string): Promise<void> {
+    const loader = new THREE.TextureLoader()
+    const [normalMap, aoMap] = await Promise.all([loader.loadAsync(normalUrl), loader.loadAsync(aoUrl)])
+
+    for (const texture of [normalMap, aoMap]) {
+      texture.wrapS = THREE.RepeatWrapping
+      texture.wrapT = THREE.RepeatWrapping
+    }
+    // AO is a linear mask, not colour; tagging it sRGB would darken it twice.
+    aoMap.colorSpace = THREE.NoColorSpace
+    normalMap.colorSpace = THREE.NoColorSpace
+
+    this.detailNormalTexture = normalMap
+    this.detailAoTexture = aoMap
+
+    const uniforms = this.detailUniforms
+    if (uniforms) {
+      uniforms.detailNormalMap.value = normalMap
+      uniforms.detailAoMap.value = aoMap
+      uniforms.hasDetail.value = 1
+    }
   }
 
   update(dt: number): void {

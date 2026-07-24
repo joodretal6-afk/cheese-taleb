@@ -5,7 +5,7 @@ import { Loop, TICK_DT } from './engine/loop'
 import { clamp, damp } from './engine/math'
 import { Terrain, TERRAIN_SIZE } from './world/terrain'
 import { TerrainMesh } from './world/terrain-mesh'
-import { createBoundaryWalls, createScene, scatterRocks } from './world/scene'
+import { createBoundaryWalls, createScene } from './world/scene'
 import { PICKUP_SPEC, Vehicle, rotateVector } from './vehicle/vehicle'
 import { buildTruck } from './vehicle/truck-mesh'
 import { loadTruckModel } from './vehicle/truck-model'
@@ -51,8 +51,15 @@ async function boot(): Promise<void> {
   const terrainMesh = new TerrainMesh(terrain)
   scene.add(terrainMesh.mesh)
 
-  scatterRocks(RAPIER, world, scene, terrain)
+  // Rocks are deliberately absent: the arena is a clean mud field, and its
+  // relief comes from the height field and the surface material instead.
   createBoundaryWalls(RAPIER, world)
+
+  // Non-blocking: the ground draws untextured for the first frames rather than
+  // holding the whole boot on a 6MB pair of 2048px maps.
+  void terrainMesh
+    .loadSurfaceDetail('./textures/ground-normal.png', './textures/ground-ao.png')
+    .catch((error: unknown) => console.warn('surface detail unavailable:', error))
 
   // Spawn on flat-ish ground near the middle, facing across the arena.
   const spawnX = TERRAIN_SIZE * 0.5

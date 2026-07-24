@@ -26,8 +26,16 @@ export const MESH_RES = 256
 
 const HEIGHT_STEP = TERRAIN_SIZE / (HEIGHT_RES - 1)
 
-/** Deepest a rut may cut below the original ground, in metres. */
-const MAX_RUT_DEPTH = 0.17
+/**
+ * Deepest a rut may cut below the original ground, in metres.
+ *
+ * Kept shallow deliberately. At 17cm the truck dug a pit under itself faster
+ * than it could drive out of one: every frame deepened the hole it was sitting
+ * in, and the berm thrown up ahead of the wheel became a wall to climb. The
+ * result looked like low grip but was really self-inflicted terrain, which is
+ * why adding grip made it worse rather than better.
+ */
+const MAX_RUT_DEPTH = 0.06
 
 /** Channels in the surface texture the ground shader reads. */
 export interface SurfaceSample {
