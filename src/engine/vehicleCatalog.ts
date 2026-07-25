@@ -297,6 +297,102 @@ export function getVehicle(id: string): VehicleSpec {
 }
 
 /**
+ * Physical dimensions the estimator needs, all in metres.
+ */
+export interface VehicleDims {
+  lengthM: number
+  widthM: number
+  heightM: number
+  wheelbaseM: number
+  trackM: number
+  wheelRadiusM: number
+}
+
+/**
+ * Derive a plausible VehicleSpec from a model's size alone.
+ *
+ * Used when the user uploads a GLB we know nothing about: rather than make them
+ * type a mass and a torque curve, everything is scaled off the bounding box
+ * against the Frontier as a reference point (2050 kg, 5.2 m, 384 Nm). A Coaster
+ * bus comes out heavy and softly sprung, a buggy light and stiff — not exact,
+ * but drivable and in the right character, and every number stays in a range
+ * Vehicle.ts is happy with. The user can refine it later; they never have to.
+ */
+export function estimateVehicleSpec(
+  id: string,
+  name: string,
+  modelUrl: string,
+  dims: VehicleDims,
+  wheelNameHints: string[],
+): VehicleSpec {
+  const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
+  const L = clamp(dims.lengthM, 1.5, 25)
+  const W = clamp(dims.widthM, 1, 6)
+  const H = clamp(dims.heightM, 1, 6)
+
+  // Mass from bounding-box volume at roughly the Frontier's density, so size
+  // maps to weight the way a real vehicle roughly does.
+  const volume = L * W * H
+  const mass = clamp(volume * 120, 500, 30000)
+
+  // Box inertia, m/12·(a²+b²), softened 0.9 like the hand-tuned Frontier.
+  const inertia = {
+    x: clamp((mass / 12) * (H * H + L * L) * 0.9, 200, 4_000_000),
+    y: clamp((mass / 12) * (W * W + L * L) * 0.9, 200, 4_000_000),
+    z: clamp((mass / 12) * (W * W + H * H) * 0.9, 100, 2_000_000),
+  }
+
+  // Peak torque tracks mass at the Frontier's ratio (384 Nm / 2050 kg).
+  const peak = clamp(mass * 0.187, 90, 6000)
+  const heavy = mass > 3500 // trucks and buses: diesel-ish, low and broad
+  const idle = heavy ? 650 : 800
+  const redline = heavy ? 4200 : 6000
+
+  // Springs must hold a quarter of the mass; scale rate and damping with it.
+  const springK = clamp(mass * 22, 18000, 260000)
+
+  const radius = clamp(dims.wheelRadiusM, 0.22, 0.9)
+
+  return {
+    id,
+    name,
+    modelUrl,
+    wheelNameHints,
+    targetLengthM: L,
+    mass,
+    comHeight: clamp(H * 0.4, 0.4, 2.2),
+    inertia,
+    engine: {
+      idleRpm: idle,
+      redlineRpm: redline,
+      torqueRpm: [idle, redline * 0.28, redline * 0.5, redline * 0.66, redline * 0.82, redline],
+      torqueNm: [peak * 0.62, peak * 0.85, peak * 0.98, peak, peak * 0.9, peak * 0.72],
+    },
+    drivetrain: {
+      gears: heavy ? [-3.2, 0, 4.2, 2.4, 1.5, 1.0, 0.78] : [-2.9, 0, 3.6, 2.2, 1.5, 1.0, 0.82],
+      finalDrive: heavy ? 4.6 : 3.9,
+      efficiency: 0.85,
+      awd: true,
+    },
+    suspension: {
+      restLength: clamp(radius * 0.9, 0.24, 0.6),
+      maxCompression: clamp(radius * 0.6, 0.14, 0.4),
+      maxDroop: clamp(radius * 0.4, 0.1, 0.3),
+      springK,
+      dampCompress: clamp(springK * 0.075, 1500, 20000),
+      dampRebound: clamp(springK * 0.11, 2200, 30000),
+      antiRoll: clamp(springK * 0.2, 4000, 60000),
+    },
+    tyre: {
+      baseMu: 1.1,
+      // Scale spin inertia with the wheel; the Frontier's 9.5 is for a 0.4 m tyre.
+      wheelInertia: clamp(9.5 * (radius / 0.4) ** 2, 3, 120),
+      maxSteerDeg: heavy ? 42 : 34,
+    },
+  }
+}
+
+/**
  * Structural and physical sanity check on one spec. Returns every problem it
  * finds — an empty array means the spec is safe to hand to Vehicle.ts.
  *

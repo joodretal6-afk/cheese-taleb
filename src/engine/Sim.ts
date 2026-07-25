@@ -19,11 +19,13 @@ import { Terrain } from './Terrain'
 import { Environment } from './Environment'
 import { Input } from './Input'
 import { Vehicle } from './Vehicle'
-import { loadVehicle, MudCoat, type LoadedVehicle } from './VehicleModel'
+import { loadVehicle, MudCoat, DEFAULT_WHEEL_HINTS, type LoadedVehicle } from './VehicleModel'
 import {
   DEFAULT_VEHICLE_ID,
+  estimateVehicleSpec,
   getVehicle,
   validateSpec,
+  VEHICLES,
   type VehicleSpec,
 } from './vehicleCatalog'
 import { Character, type OrientedBox } from './Character'
@@ -111,6 +113,9 @@ export class Sim {
   region?: RegionScene
   /** Which car is being driven. Every physics number comes from here. */
   vehicleSpec: VehicleSpec = getVehicle(DEFAULT_VEHICLE_ID)
+  /** GLBs the user uploaded this session, keyed by generated id. */
+  private readonly customVehicles = new Map<string, VehicleSpec>()
+  private customSeq = 0
   /** Which drop-in assets the user supplied, if any. */
   overrides: OverrideManifest = { ground: {}, props: { tree: null, rock: null } }
   /** Whether the player is driving or walking. */
@@ -166,6 +171,8 @@ export class Sim {
     this.unloadRegion = this.unloadRegion.bind(this)
     this.applyRegionPalette = this.applyRegionPalette.bind(this)
     this.setVehicle = this.setVehicle.bind(this)
+    this.addCustomVehicle = this.addCustomVehicle.bind(this)
+    this.listVehicles = this.listVehicles.bind(this)
     this.setBrush = this.setBrush.bind(this)
     this.brushUndo = this.brushUndo.bind(this)
     this.brushClear = this.brushClear.bind(this)
@@ -248,12 +255,16 @@ export class Sim {
    * parts differently and some arrive in millimetres.
    */
   private async loadVehicleModel(spec: VehicleSpec, onProgress?: (f: number) => void) {
+    // A custom vehicle's URL is an extensionless blob:; tell the loader it is a
+    // GLB so it can pick the right importer.
+    const ext = /^(blob:|data:)/.test(spec.modelUrl) ? '.glb' : undefined
     this.model = await loadVehicle(
       this.scene,
       spec.modelUrl,
       onProgress,
       spec.wheelNameHints,
       spec.targetLengthM,
+      ext,
     )
     this.mudCoat = new MudCoat(this.model)
   }
@@ -267,7 +278,7 @@ export class Sim {
    * leave the player with no vehicle at all.
    */
   async setVehicle(id: string): Promise<boolean> {
-    const spec = getVehicle(id)
+    const spec = this.resolveSpec(id)
     if (spec.id === this.vehicleSpec.id) return true
 
     const problems = validateSpec(spec)
@@ -275,11 +286,75 @@ export class Sim {
       console.warn('[vehicle]', spec.id, problems)
       return false
     }
+    return this.swapVehicle(spec)
+  }
 
+  /**
+   * Load and drive any GLB the user dropped in, with no catalogue entry and no
+   * knowledge of its wheel names.
+   *
+   * The loader finds the wheels by name, then by axle grouping, then falls back
+   * to four contact corners of the body box, so it never refuses a model. The
+   * physics spec is estimated from the model's size. Returns the new id, or null
+   * if the file could not be read as a vehicle at all.
+   */
+  async addCustomVehicle(url: string, name: string, ext = '.glb'): Promise<string | null> {
+    const id = `custom_${(name || 'vehicle').replace(/\s+/g, '_')}_${this.customSeq++}`
+    // Load once here to measure it; that same model is reused for the swap, so
+    // a big bus GLB is not downloaded twice. The extension is passed explicitly
+    // because an uploaded file arrives as an extensionless blob: URL.
+    let model: LoadedVehicle
+    try {
+      model = await loadVehicle(this.scene, url, undefined, undefined, 5, ext)
+    } catch (err) {
+      console.error('[vehicle] could not load custom model', err)
+      return null
+    }
+    const he = model.halfExtents
+    const spec = estimateVehicleSpec(id, name || 'مركبة', url, {
+      lengthM: he.z * 2,
+      widthM: he.x * 2,
+      heightM: he.y * 2,
+      wheelbaseM: model.wheelbase,
+      trackM: model.track,
+      wheelRadiusM: model.restHeight,
+    }, [...DEFAULT_WHEEL_HINTS])
+    this.customVehicles.set(id, spec)
+    const ok = await this.swapVehicle(spec, model)
+    return ok ? id : null
+  }
+
+  /** Catalogue plus every custom vehicle added this session, for the UI list. */
+  listVehicles(): { id: string; name: string; custom: boolean; virtualWheels: boolean }[] {
+    const cat = VEHICLES.map((v) => ({ id: v.id, name: v.name, custom: false, virtualWheels: false }))
+    const custom = [...this.customVehicles.values()].map((v) => ({
+      id: v.id,
+      name: v.name,
+      custom: true,
+      virtualWheels: this.vehicleSpec.id === v.id ? this.model.virtualWheels : false,
+    }))
+    return [...cat, ...custom]
+  }
+
+  /** Custom specs win over the static catalogue; unknown ids fall to default. */
+  private resolveSpec(id: string): VehicleSpec {
+    return this.customVehicles.get(id) ?? getVehicle(id)
+  }
+
+  /**
+   * The shared swap: put the new car exactly where the old one stood, facing the
+   * same way. `preloaded` reuses a model already imported by addCustomVehicle.
+   */
+  private async swapVehicle(spec: VehicleSpec, preloaded?: LoadedVehicle): Promise<boolean> {
     const previous = this.model
     const previousMud = this.mudCoat
     try {
-      await this.loadVehicleModel(spec)
+      if (preloaded) {
+        this.model = preloaded
+        this.mudCoat = new MudCoat(preloaded)
+      } else {
+        await this.loadVehicleModel(spec)
+      }
     } catch (err) {
       console.error('[vehicle] could not load', spec.modelUrl, err)
       this.model = previous
@@ -287,7 +362,6 @@ export class Sim {
       return false
     }
 
-    // Put the new car where the old one was standing, facing the same way.
     const t = this.vehicle.body.translation()
     const r = this.vehicle.body.rotation()
     for (const m of [...previous.bodyMeshes, ...Object.values(previous.wheels).flatMap((w) => w.meshes)]) {
@@ -297,14 +371,7 @@ export class Sim {
     this.world.removeRigidBody(this.vehicle.body)
 
     this.vehicleSpec = spec
-    this.vehicle = new Vehicle(
-      RAPIER,
-      this.world,
-      this.field,
-      this.model,
-      new Vector3(t.x, t.y, t.z),
-      spec,
-    )
+    this.vehicle = new Vehicle(RAPIER, this.world, this.field, this.model, new Vector3(t.x, t.y, t.z), spec)
     this.vehicle.body.setRotation(r, true)
     for (const m of [
       ...this.model.bodyMeshes,

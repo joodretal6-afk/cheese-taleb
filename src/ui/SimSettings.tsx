@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useSim, type TerrainQuality, type WeatherKind } from '../store/simStore'
 import { DEFAULT_VEHICLE_ID, getVehicle, VEHICLES } from '../engine/vehicleCatalog'
+import { IconAssets } from './icons'
 import { Panel } from './Chrome'
 import { IconPlay, IconReset, IconStop } from './icons'
 
@@ -90,11 +91,20 @@ function Select<T extends string>({
   )
 }
 
+interface VehicleListItem {
+  id: string
+  name: string
+  custom: boolean
+  virtualWheels: boolean
+}
+
 type SimWindow = Window & {
   sim?: {
     vehicle?: { reset(): void }
     vehicleSpec?: { id: string }
     setVehicle?(id: string): Promise<boolean>
+    addCustomVehicle?(url: string, name: string, ext?: string): Promise<string | null>
+    listVehicles?(): VehicleListItem[]
   }
 }
 
@@ -108,6 +118,15 @@ export function SimSettings() {
   // missing file is reported plainly instead of leaving the player with no car.
   const [carId, setCarId] = useState(DEFAULT_VEHICLE_ID)
   const [carNote, setCarNote] = useState<string | null>(null)
+  const [cars, setCars] = useState<VehicleListItem[]>(() =>
+    VEHICLES.map((v) => ({ id: v.id, name: v.name, custom: false, virtualWheels: false })),
+  )
+  const [uploading, setUploading] = useState(false)
+
+  function refreshCars() {
+    const list = (window as SimWindow).sim?.listVehicles?.()
+    if (list?.length) setCars(list)
+  }
 
   async function pickCar(id: string) {
     const previous = carId
@@ -124,6 +143,34 @@ export function SimSettings() {
     if (!ok) {
       setCarId(previous)
       setCarNote(`${getVehicle(id).modelUrl} غير موجود — ضع الملف في public/models/`)
+    }
+  }
+
+  async function uploadCar(file: File | undefined) {
+    if (!file) return
+    const sim = (window as SimWindow).sim
+    if (!sim?.addCustomVehicle) return
+    setUploading(true)
+    setCarNote(null)
+    try {
+      // An object URL, not base64: a vehicle GLB is megabytes and the loader
+      // reads a URL directly.
+      const url = URL.createObjectURL(file)
+      const name = file.name.replace(/\.(glb|gltf)$/i, '')
+      const ext = /\.gltf$/i.test(file.name) ? '.gltf' : '.glb'
+      const id = await sim.addCustomVehicle(url, name, ext)
+      if (!id) {
+        setCarNote('تعذّر تحميل الملف كمركبة — تأكد أنه GLB صالح')
+        return
+      }
+      refreshCars()
+      setCarId(id)
+      const item = (window as SimWindow).sim?.listVehicles?.().find((v) => v.id === id)
+      if (item?.virtualWheels) {
+        setCarNote('تم — لكن لم يُعثر على إطارات منفصلة، فلن تدور بصرياً (يقودها بشكل طبيعي)')
+      }
+    } finally {
+      setUploading(false)
     }
   }
 
@@ -179,14 +226,40 @@ export function SimSettings() {
           }))}
           onChange={(v) => set('terrainQuality', v)}
         />
-        <Select
-          label="المركبة"
-          value={carId}
-          options={VEHICLES.map((v) => ({ value: v.id, label: v.name }))}
-          onChange={(v) => void pickCar(v)}
-        />
+        <div className="flex items-center gap-2">
+          <span className="w-16 shrink-0 text-[12px] text-mist-400">المركبة</span>
+          <select
+            className="min-w-0 flex-1 rounded-md border border-ink-600 bg-ink-800 px-2.5 py-1.5 text-[12px] text-mist-200 outline-none focus:border-brand-500"
+            value={carId}
+            aria-label="المركبة"
+            onChange={(e) => void pickCar(e.target.value)}
+          >
+            {cars.map((v) => (
+              <option key={v.id} value={v.id}>
+                {v.custom ? `★ ${v.name}` : v.name}
+              </option>
+            ))}
+          </select>
+          <label
+            title="ارفع مركبة GLB"
+            className="grid h-8 w-8 shrink-0 cursor-pointer place-content-center rounded-md border border-ink-600 text-mist-300 transition-colors hover:bg-ink-800 hover:text-mist-100"
+          >
+            {uploading ? (
+              <span className="text-[10px]">…</span>
+            ) : (
+              <IconAssets className="h-4 w-4" />
+            )}
+            <input
+              type="file"
+              accept=".glb,.gltf,model/gltf-binary"
+              className="hidden"
+              disabled={uploading}
+              onChange={(e) => void uploadCar(e.target.files?.[0])}
+            />
+          </label>
+        </div>
         {carNote && (
-          <p className="text-[11px] leading-4 text-bad-500" dir="rtl">
+          <p className="text-[11px] leading-4 text-mist-300" dir="rtl">
             {carNote}
           </p>
         )}

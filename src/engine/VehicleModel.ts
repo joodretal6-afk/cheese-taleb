@@ -58,16 +58,124 @@ export interface LoadedVehicle {
   track: number
   /** Height of the chassis origin above the ground when at rest. */
   restHeight: number
+  /** True when no wheel meshes were found and contact points are synthetic. */
+  virtualWheels: boolean
 }
 
-/** Node-name fragments that make up a wheel assembly in the Frontier export. */
-const WHEEL_NAME_HINTS = ['rodagti', 'b1', 'Matte_Black__1']
+/**
+ * Node-name fragments that make up a wheel assembly.
+ *
+ * The Frontier's own KeyShot names come first, then the words most GLB
+ * exporters actually use, so a car downloaded off the internet is usually
+ * recognised without the user knowing a single node name. Matching is
+ * case-insensitive — 'Wheel', 'WHEEL' and 'wheel' are one thing.
+ */
+const WHEEL_NAME_HINTS = [
+  'rodagti', 'b1', 'Matte_Black__1',
+  'wheel', 'tire', 'tyre', 'rim', 'hub', 'roda', 'rueda',
+]
+
+/** The broad default hints, for a custom vehicle whose node names are unknown. */
+export const DEFAULT_WHEEL_HINTS = WHEEL_NAME_HINTS
 
 /** Used only to detect the export's unit scale, never to distort proportions. */
 const TARGET_LENGTH_M = 5.3
 
 function isWheelMesh(name: string, hints: string[]): boolean {
-  return hints.some((h) => name.includes(h))
+  const lower = name.toLowerCase()
+  return hints.some((h) => lower.includes(h.toLowerCase()))
+}
+
+interface WheelCluster {
+  center: Vector3
+  meshes: AbstractMesh[]
+  min: Vector3
+  max: Vector3
+}
+
+/** Proximity-cluster a set of wheel meshes into groups. */
+function clusterWheelMeshes(wheelMeshes: AbstractMesh[]): WheelCluster[] {
+  const clusters: WheelCluster[] = []
+  for (const m of wheelMeshes) {
+    const c = worldCenter(m)
+    const bb = m.getBoundingInfo().boundingBox
+    let found = clusters.find((cl) => Vector3.Distance(cl.center, c) < 0.6)
+    if (!found) {
+      found = { center: c.clone(), meshes: [], min: bb.minimumWorld.clone(), max: bb.maximumWorld.clone() }
+      clusters.push(found)
+    }
+    found.meshes.push(m)
+    found.min.minimizeInPlace(bb.minimumWorld)
+    found.max.maximizeInPlace(bb.maximumWorld)
+  }
+  for (const cl of clusters) cl.center = cl.min.add(cl.max).scale(0.5)
+  return clusters
+}
+
+/**
+ * Collapse however many wheel clusters were found into exactly four contact
+ * corners, by quadrant: front/back split on Z, left/right on X. A pickup has
+ * four already; a Coaster bus has six (a dual rear axle) and an artic has more —
+ * all of them come down to four corners the suspension can push on, with the
+ * duals merged into one visual group. Returns null if any corner is empty, so
+ * a three-wheeler or a bad detection falls through to the virtual wheels.
+ */
+function reduceToFourCorners(clusters: WheelCluster[]): WheelCluster[] | null {
+  if (clusters.length < 4) return null
+  const zs = clusters.map((c) => c.center.z)
+  const xs = clusters.map((c) => c.center.x)
+  const midZ = (Math.min(...zs) + Math.max(...zs)) / 2
+  const midX = (Math.min(...xs) + Math.max(...xs)) / 2
+
+  const quads = new Map<string, WheelCluster>()
+  for (const cl of clusters) {
+    const key = `${cl.center.z < midZ ? 'F' : 'B'}${cl.center.x < midX ? 'L' : 'R'}`
+    const q = quads.get(key)
+    if (!q) {
+      quads.set(key, { center: cl.center.clone(), meshes: [...cl.meshes], min: cl.min.clone(), max: cl.max.clone() })
+    } else {
+      q.meshes.push(...cl.meshes)
+      q.min.minimizeInPlace(cl.min)
+      q.max.maximizeInPlace(cl.max)
+    }
+  }
+  if (quads.size !== 4) return null
+  const out = [...quads.values()]
+  for (const q of out) q.center = q.min.add(q.max).scale(0.5)
+  return out
+}
+
+/**
+ * Four contact corners derived from the body box alone, used when no wheel
+ * meshes can be found (they are fused into the body, or named nothing we know).
+ * The vehicle drives perfectly — the raycast suspension only needs contact
+ * points — the wheels just do not visibly spin. Better a car that drives with
+ * no wheel animation than a model that refuses to load.
+ */
+function virtualCorners(bodyMin: Vector3, bodyMax: Vector3): WheelCluster[] {
+  const W = bodyMax.x - bodyMin.x
+  const L = bodyMax.z - bodyMin.z
+  const H = bodyMax.y - bodyMin.y
+  const cx = (bodyMin.x + bodyMax.x) / 2
+  const r = Math.min(Math.max(H * 0.16, 0.28), L * 0.14)
+  const halfW = W * 0.42
+  const halfL = L * 0.38
+  const y = bodyMin.y + r
+  const make = (x: number, z: number): WheelCluster => {
+    const center = new Vector3(x, y, z)
+    return {
+      center,
+      meshes: [],
+      min: new Vector3(x - r * 0.4, y - r, z - r),
+      max: new Vector3(x + r * 0.4, y + r, z + r),
+    }
+  }
+  return [
+    make(cx - halfW, -halfL + (bodyMin.z + bodyMax.z) / 2),
+    make(cx + halfW, -halfL + (bodyMin.z + bodyMax.z) / 2),
+    make(cx - halfW, halfL + (bodyMin.z + bodyMax.z) / 2),
+    make(cx + halfW, halfL + (bodyMin.z + bodyMax.z) / 2),
+  ]
 }
 
 function worldCenter(mesh: AbstractMesh): Vector3 {
@@ -89,11 +197,19 @@ export async function loadVehicle(
   onProgress?: (fraction: number) => void,
   wheelHints: string[] = WHEEL_NAME_HINTS,
   targetLengthM: number = TARGET_LENGTH_M,
+  /**
+   * Loader to use when the URL has no extension to detect it from — a blob: URL
+   * from an in-app file upload, for instance. Babylon picks the glTF loader off
+   * the ".glb" of a path; a blob URL has no path, so without this the import
+   * fails silently and the user's car just never appears.
+   */
+  pluginExtension?: string,
 ): Promise<LoadedVehicle> {
   const result = await ImportMeshAsync(url, scene, {
     onProgress: (ev) => {
       if (onProgress) onProgress(ev.lengthComputable ? ev.loaded / ev.total : 0)
     },
+    ...(pluginExtension ? { pluginExtension } : {}),
   })
 
   const meshes = result.meshes.filter((m): m is Mesh => m instanceof Mesh && !!m.getTotalVertices())
@@ -134,38 +250,8 @@ export async function loadVehicle(
     }
   }
 
-  // ---------------------------------------------------------------- wheels
-  const wheelMeshes = meshes.filter((m) => isWheelMesh(m.name, wheelHints))
-  if (wheelMeshes.length < 4) throw new Error('could not locate the wheel meshes')
-
-  // Cluster wheel parts by their world centre — four groups fall out naturally.
-  interface Cluster { center: Vector3; meshes: AbstractMesh[]; min: Vector3; max: Vector3 }
-  const clusters: Cluster[] = []
-  for (const m of wheelMeshes) {
-    const c = worldCenter(m)
-    const bb = m.getBoundingInfo().boundingBox
-    let found = clusters.find((cl) => Vector3.Distance(cl.center, c) < 0.6)
-    if (!found) {
-      found = { center: c.clone(), meshes: [], min: bb.minimumWorld.clone(), max: bb.maximumWorld.clone() }
-      clusters.push(found)
-    }
-    found.meshes.push(m)
-    found.min.minimizeInPlace(bb.minimumWorld)
-    found.max.maximizeInPlace(bb.maximumWorld)
-  }
-  if (clusters.length !== 4) {
-    const detail = wheelMeshes
-      .map((m) => `${m.name} @ ${worldCenter(m).toString()}`)
-      .join('\n  ')
-    throw new Error(
-      `expected 4 wheel clusters, found ${clusters.length}\n` +
-        `cluster centres: ${clusters.map((c) => c.center.toString()).join(' | ')}\n` +
-        `  ${detail}`,
-    )
-  }
-  for (const cl of clusters) cl.center = cl.min.add(cl.max).scale(0.5)
-
-  // Overall body bounds (used to work out which axle is the front one).
+  // Overall body bounds, needed before wheel detection so the fallbacks can
+  // derive contact corners from the box.
   const bodyMin = new Vector3(Infinity, Infinity, Infinity)
   const bodyMax = new Vector3(-Infinity, -Infinity, -Infinity)
   for (const m of meshes) {
@@ -173,6 +259,25 @@ export async function loadVehicle(
     bodyMin.minimizeInPlace(bb.minimumWorld)
     bodyMax.maximizeInPlace(bb.maximumWorld)
   }
+
+  // ---------------------------------------------------------------- wheels
+  // Three strategies, best first, so ANY vehicle GLB loads and drives:
+  //   1. named wheel meshes clustered into four corners (spinning wheels);
+  //   2. the same, reducing a 6/8-wheel vehicle's axles to four corners;
+  //   3. virtual corners from the body box (drives, wheels do not spin).
+  const wheelMeshes = meshes.filter((m) => isWheelMesh(m.name, wheelHints))
+  let clusters: WheelCluster[] = clusterWheelMeshes(wheelMeshes)
+  let virtualWheels = false
+  if (clusters.length !== 4) {
+    const reduced = reduceToFourCorners(clusters)
+    if (reduced) {
+      clusters = reduced
+    } else {
+      clusters = virtualCorners(bodyMin, bodyMax)
+      virtualWheels = true
+    }
+  }
+  const wheelMeshSet = new Set(clusters.flatMap((c) => c.meshes))
 
   // Axle Z positions (two distinct values).
   const zs = [...new Set(clusters.map((c) => Math.round(c.center.z * 100) / 100))].sort((a, b) => a - b)
@@ -251,10 +356,11 @@ export async function loadVehicle(
     }
   }
 
-  // Everything else becomes the body.
+  // Everything not claimed by a wheel cluster becomes the body. Membership,
+  // not name, so virtual and reduced wheels are excluded correctly too.
   const bodyMeshes: AbstractMesh[] = []
   for (const m of meshes) {
-    if (isWheelMesh(m.name, wheelHints)) continue
+    if (wheelMeshSet.has(m)) continue
     m.setParent(shift)
     bodyMeshes.push(m)
   }
@@ -292,6 +398,7 @@ export async function loadVehicle(
     wheelbase,
     track,
     restHeight: wheelRadius,
+    virtualWheels,
   }
 }
 
