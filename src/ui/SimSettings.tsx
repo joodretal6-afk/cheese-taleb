@@ -1,4 +1,6 @@
+import { useState } from 'react'
 import { useSim, type TerrainQuality, type WeatherKind } from '../store/simStore'
+import { DEFAULT_VEHICLE_ID, getVehicle, VEHICLES } from '../engine/vehicleCatalog'
 import { Panel } from './Chrome'
 import { IconPlay, IconReset, IconStop } from './icons'
 
@@ -88,10 +90,40 @@ function Select<T extends string>({
   )
 }
 
+type SimWindow = Window & {
+  sim?: {
+    vehicle?: { reset(): void }
+    vehicleSpec?: { id: string }
+    setVehicle?(id: string): Promise<boolean>
+  }
+}
+
 export function SimSettings() {
   const s = useSim((st) => st.settings)
   const set = useSim((st) => st.set)
   const ready = useSim((st) => st.engineReady)
+
+  // Only the Frontier's GLB ships with the app. The rest of the catalogue is
+  // real, calibrated physics waiting for a model — so they are offered, and a
+  // missing file is reported plainly instead of leaving the player with no car.
+  const [carId, setCarId] = useState(DEFAULT_VEHICLE_ID)
+  const [carNote, setCarNote] = useState<string | null>(null)
+
+  async function pickCar(id: string) {
+    const previous = carId
+    setCarId(id)
+    setCarNote(null)
+    const swap = (window as SimWindow).sim?.setVehicle
+    if (!swap) {
+      setCarId(previous)
+      return
+    }
+    const ok = await swap(id)
+    if (!ok) {
+      setCarId(previous)
+      setCarNote(`${getVehicle(id).modelUrl} غير موجود — ضع الملف في public/models/`)
+    }
+  }
 
   const hh = Math.floor(s.timeOfDay)
   const mm = Math.round((s.timeOfDay - hh) * 60)
@@ -145,6 +177,17 @@ export function SimSettings() {
           }))}
           onChange={(v) => set('terrainQuality', v)}
         />
+        <Select
+          label="المركبة"
+          value={carId}
+          options={VEHICLES.map((v) => ({ value: v.id, label: v.name }))}
+          onChange={(v) => void pickCar(v)}
+        />
+        {carNote && (
+          <p className="text-[11px] leading-4 text-bad-500" dir="rtl">
+            {carNote}
+          </p>
+        )}
 
         <div className="mt-auto flex gap-2 pt-1">
           <button

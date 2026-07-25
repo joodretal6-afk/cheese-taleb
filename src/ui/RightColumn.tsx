@@ -2,15 +2,17 @@ import { useState } from 'react'
 import { AIPanel } from './AIPanel'
 import { PartsGrid } from './PartsGrid'
 import { PhotoStudio } from './PhotoStudio'
-import { IconAI, IconAssets } from './icons'
+import { RegionPanel } from './RegionPanel'
+import { IconAI, IconAssets, IconMountain } from './icons'
 
-type Tab = 'generate' | 'photo'
+type Tab = 'generate' | 'photo' | 'region'
 
 /**
- * The right-hand column carries two workflows that both end in "a texture on a
- * part": generating one from a prompt, and deriving one from a real photo. They
- * are tabbed rather than stacked because each needs the full column height —
- * the photo tool in particular has a corner-dragging canvas.
+ * The right-hand column carries the three workflows that put surfaces into the
+ * world: generating a texture from a prompt, deriving one from a real photo,
+ * and dressing a whole real neighbourhood. They are tabbed rather than stacked
+ * because each needs the full column height — the photo tool has a
+ * corner-dragging canvas, the region tool a swatch list per surface.
  */
 export function RightColumn() {
   const [tab, setTab] = useState<Tab>('generate')
@@ -30,16 +32,28 @@ export function RightColumn() {
           Icon={IconAssets}
           label="استوديو الصور"
         />
+        <TabButton
+          active={tab === 'region'}
+          onClick={() => setTab('region')}
+          Icon={IconMountain}
+          label="المنطقة"
+        />
       </div>
 
-      {tab === 'generate' ? (
+      {tab === 'generate' && (
         <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-3">
           <AIPanel />
           <PartsGrid />
         </div>
-      ) : (
+      )}
+      {tab === 'photo' && (
         <div className="min-h-0">
           <PhotoStudio />
+        </div>
+      )}
+      {tab === 'region' && (
+        <div className="min-h-0">
+          <RegionPanel />
         </div>
       )}
     </div>

@@ -61,9 +61,32 @@ export interface GeneratedTexture {
   createdAt: number
 }
 
+/**
+ * The real-world region currently in the scene.
+ *
+ * This lives in the store rather than in the region panel because the panel is
+ * unmounted whenever the user switches to another tab, and the palette is work
+ * — sometimes an evening of it. It would be lost. The attribution string has a
+ * second reason: OSM is ODbL, crediting it is a licence obligation, and an
+ * obligation that only holds while one tab happens to be open is not one that
+ * is being met.
+ */
+export interface RegionState {
+  /** Slug of the loaded region, empty when none is. */
+  name: string
+  loaded: boolean
+  /** Credit line from the baked file. Must be shown while a region is loaded. */
+  attribution: string | null
+  /** Serialised palette, so the store stays free of engine imports. */
+  paletteJson: string | null
+  /** Whether inferred buildings were requested for the last load. */
+  buildings: boolean
+}
+
 interface SimState {
   settings: SimSettings
   telemetry: Telemetry
+  region: RegionState
   parts: VehiclePart[]
   selectedPartId: string
   /** Generated results, newest first, keyed by part. */
@@ -86,6 +109,7 @@ interface SimState {
   setLoadProgress: (v: number) => void
   setActiveSection: (s: string) => void
   setPartDamage: (id: string, damage: number) => void
+  patchRegion: (patch: Partial<RegionState>) => void
 }
 
 /**
@@ -156,6 +180,7 @@ export const useSim = create<SimState>((set) => ({
   engineReady: false,
   loadProgress: 0,
   activeSection: 'dashboard',
+  region: { name: '', loaded: false, attribution: null, paletteJson: null, buildings: true },
 
   set: (key, value) => set((s) => ({ settings: { ...s.settings, [key]: value } })),
   pushTelemetry: (t) => set((s) => ({ telemetry: { ...s.telemetry, ...t } })),
@@ -173,6 +198,7 @@ export const useSim = create<SimState>((set) => ({
   setActiveSection: (s) => set({ activeSection: s }),
   setPartDamage: (id, damage) =>
     set((s) => ({ parts: s.parts.map((p) => (p.id === id ? { ...p, damage } : p)) })),
+  patchRegion: (patch) => set((s) => ({ region: { ...s.region, ...patch } })),
 }))
 
 /** Non-reactive snapshot for the render loop — avoids a React subscription per frame. */

@@ -60,14 +60,14 @@ export interface LoadedVehicle {
   restHeight: number
 }
 
-/** Node-name fragments that make up a wheel assembly in this export. */
+/** Node-name fragments that make up a wheel assembly in the Frontier export. */
 const WHEEL_NAME_HINTS = ['rodagti', 'b1', 'Matte_Black__1']
 
 /** Used only to detect the export's unit scale, never to distort proportions. */
 const TARGET_LENGTH_M = 5.3
 
-function isWheelMesh(name: string): boolean {
-  return WHEEL_NAME_HINTS.some((h) => name.includes(h))
+function isWheelMesh(name: string, hints: string[]): boolean {
+  return hints.some((h) => name.includes(h))
 }
 
 function worldCenter(mesh: AbstractMesh): Vector3 {
@@ -76,10 +76,19 @@ function worldCenter(mesh: AbstractMesh): Vector3 {
   return bb.centerWorld.clone()
 }
 
+/**
+ * @param wheelHints node-name fragments identifying the wheel assemblies in
+ *   THIS export. Every GLB names its parts differently, so the catalogue
+ *   carries them per car; the Frontier's are the default.
+ * @param targetLengthM nominal bumper-to-bumper length, used only to detect the
+ *   export's unit scale.
+ */
 export async function loadVehicle(
   scene: Scene,
   url: string,
   onProgress?: (fraction: number) => void,
+  wheelHints: string[] = WHEEL_NAME_HINTS,
+  targetLengthM: number = TARGET_LENGTH_M,
 ): Promise<LoadedVehicle> {
   const result = await ImportMeshAsync(url, scene, {
     onProgress: (ev) => {
@@ -115,7 +124,7 @@ export async function loadVehicle(
     }
     const longest = Math.max(max.x - min.x, max.z - min.z)
     if (longest > 0) {
-      const exp = Math.round(Math.log10(TARGET_LENGTH_M / longest))
+      const exp = Math.round(Math.log10(targetLengthM / longest))
       if (exp !== 0) {
         const k = Math.pow(10, exp)
         staging.scaling.scaleInPlace(k)
@@ -126,7 +135,7 @@ export async function loadVehicle(
   }
 
   // ---------------------------------------------------------------- wheels
-  const wheelMeshes = meshes.filter((m) => isWheelMesh(m.name))
+  const wheelMeshes = meshes.filter((m) => isWheelMesh(m.name, wheelHints))
   if (wheelMeshes.length < 4) throw new Error('could not locate the wheel meshes')
 
   // Cluster wheel parts by their world centre — four groups fall out naturally.
@@ -245,7 +254,7 @@ export async function loadVehicle(
   // Everything else becomes the body.
   const bodyMeshes: AbstractMesh[] = []
   for (const m of meshes) {
-    if (isWheelMesh(m.name)) continue
+    if (isWheelMesh(m.name, wheelHints)) continue
     m.setParent(shift)
     bodyMeshes.push(m)
   }

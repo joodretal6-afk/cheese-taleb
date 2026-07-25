@@ -124,6 +124,18 @@ export class Environment {
   private currentWeather: WeatherKind = 'overcast'
   private probeDirty = true
 
+  /**
+   * Multiplier on every weather profile's fog density.
+   *
+   * The profiles were tuned against a 220 m play area, where they read as
+   * atmosphere. Applied unchanged to a 2 km neighbourhood the same numbers are
+   * an opaque wall — EXP2 fog at 0.0062 leaves nothing visible past ~400 m, so
+   * the far half of the region is a flat grey field. Scaling by the ratio of
+   * world sizes keeps the *look* — haze that thickens at the horizon — while
+   * putting the horizon where the world actually ends.
+   */
+  private readonly fogScale: number
+
   /** Extra ground wetness contributed by the weather, 0..1. */
   wetBias = 0
   /** Snow coverage on the ground, 0..1. */
@@ -180,9 +192,15 @@ export class Environment {
     scene.environmentTexture = this.probe.cubeTexture
     scene.environmentIntensity = 0.85
 
+    // Square root, not the raw ratio: fog density that fell off linearly with
+    // world size would leave a 2 km region looking like vacuum. This thins it
+    // by ~3x over 2 km, which still shows the far ridge while keeping distance
+    // readable.
+    this.fogScale = Math.sqrt(220 / Math.max(220, field.worldSize))
+
     scene.fogMode = Scene.FOGMODE_EXP2
     scene.fogColor = new Color3(0.55, 0.58, 0.62)
-    scene.fogDensity = 0.006
+    scene.fogDensity = 0.006 * this.fogScale
 
     this.applyWeather('overcast')
     this.setTimeOfDay(12)
@@ -226,7 +244,7 @@ export class Environment {
     this.currentWeather = kind
     const p = PROFILES[kind]
     this.skyMaterial.turbidity = p.turbidity
-    this.scene.fogDensity = p.fogDensity
+    this.scene.fogDensity = p.fogDensity * this.fogScale
     this.scene.fogColor = p.fogColor.clone()
     this.scene.clearColor = new Color4(p.fogColor.r, p.fogColor.g, p.fogColor.b, 1)
     this.wetBias = p.wetBias
@@ -453,5 +471,19 @@ export class Environment {
     this.probe.dispose()
     this.skybox.dispose()
     this.skyMaterial.dispose()
+    /*
+     * The lights and their shadow generator have to go too.
+     *
+     * Leaving them behind is not a slow leak — it breaks rendering on the very
+     * next Environment. Babylon expands its per-light shader includes over the
+     * lights actually in the scene, and a second sun and hemisphere push past
+     * a material's maxSimultaneousLights; the include then fails to expand and
+     * the literal `#include<...>` reaches the compiler as a syntax error on
+     * `<`. Every affected material falls back to a cruder shader, and the
+     * surviving ones are lit twice over.
+     */
+    this.shadows.dispose()
+    this.sun.dispose()
+    this.ambient.dispose()
   }
 }

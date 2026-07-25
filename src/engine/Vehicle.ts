@@ -3,6 +3,7 @@ import type RAPIER_NS from '@dimforge/rapier3d-compat'
 import type { MudField } from './MudField'
 import type { Input } from './Input'
 import type { LoadedVehicle, WheelId, WheelRig } from './VehicleModel'
+import { DEFAULT_VEHICLE_ID, getVehicle, type VehicleSpec } from './vehicleCatalog'
 
 /**
  * Raycast vehicle with a proper drivetrain.
@@ -22,34 +23,14 @@ import type { LoadedVehicle, WheelId, WheelRig } from './VehicleModel'
 
 const WHEEL_ORDER: WheelId[] = ['FL', 'FR', 'RL', 'RR']
 
-// --- Nissan Frontier 4.0 V6, roughly ------------------------------------
-const MASS = 2050
-const ENGINE_IDLE = 800
-const ENGINE_REDLINE = 6200
-const TORQUE_RPM = [800, 1500, 2500, 3500, 4000, 4800, 5600, 6200]
-const TORQUE_NM = [230, 300, 355, 378, 384, 370, 330, 270]
-const GEARS = [-2.61, 0, 3.84, 2.35, 1.52, 1.0, 0.83]
+/*
+ * Gear-array layout. These are positions in VehicleSpec.drivetrain.gears, not
+ * tuning, so they are the same for every car and stay module constants:
+ * [reverse, neutral, 1st, 2nd, ...].
+ */
 const REVERSE_INDEX = 0
 const NEUTRAL_INDEX = 1
 const FIRST_GEAR_INDEX = 2
-const FINAL_DRIVE = 3.36
-const DRIVELINE_EFF = 0.85
-
-// --- suspension ---------------------------------------------------------
-const REST_LENGTH = 0.32
-const MAX_COMPRESSION = 0.2
-const MAX_DROOP = 0.14
-const SPRING_K = 46000
-const DAMP_COMPRESS = 3400
-const DAMP_REBOUND = 5200
-const ANTIROLL = 9000
-
-// --- tyres --------------------------------------------------------------
-// Wheel + tyre + hub + brake rotor on a 33" truck wheel. A too-low value here is
-// the other classic source of tyre-model instability.
-const WHEEL_INERTIA = 9.5
-const BASE_MU = 1.12
-const MAX_STEER = (33 * Math.PI) / 180
 
 interface WheelState {
   rig: WheelRig
@@ -105,8 +86,33 @@ export class Vehicle {
   private readonly field: MudField
   private readonly wheels: WheelState[] = []
 
+  /** Which car this is. Every number below is read from here, none hardcoded. */
+  readonly spec: VehicleSpec
+
+  // Unpacked from the spec once, because the substep loop touches most of these
+  // several times per wheel per step and a property chain per read is waste.
+  private readonly MASS: number
+  private readonly ENGINE_IDLE: number
+  private readonly ENGINE_REDLINE: number
+  private readonly TORQUE_RPM: number[]
+  private readonly TORQUE_NM: number[]
+  private readonly GEARS: number[]
+  private readonly FINAL_DRIVE: number
+  private readonly DRIVELINE_EFF: number
+  private readonly REST_LENGTH: number
+  private readonly MAX_COMPRESSION: number
+  private readonly MAX_DROOP: number
+  private readonly SPRING_K: number
+  private readonly DAMP_COMPRESS: number
+  private readonly DAMP_REBOUND: number
+  private readonly ANTIROLL: number
+  private readonly WHEEL_INERTIA: number
+  private readonly BASE_MU: number
+  /** Radians. */
+  private readonly MAX_STEER: number
+
   private gearIndex = NEUTRAL_INDEX
-  private rpm = ENGINE_IDLE
+  private rpm: number
   private shiftCooldown = 0
   private fuel = 0.65
   private damage = 0
@@ -128,6 +134,7 @@ export class Vehicle {
     field: MudField,
     model: LoadedVehicle,
     spawn: Vector3,
+    spec: VehicleSpec = getVehicle(DEFAULT_VEHICLE_ID),
   ) {
     this.rapier = rapier
     this.world = world
@@ -135,15 +142,37 @@ export class Vehicle {
     this.model = model
     this.spawn = spawn.clone()
 
+    this.spec = spec
+    this.MASS = spec.mass
+    this.ENGINE_IDLE = spec.engine.idleRpm
+    this.ENGINE_REDLINE = spec.engine.redlineRpm
+    this.TORQUE_RPM = spec.engine.torqueRpm
+    this.TORQUE_NM = spec.engine.torqueNm
+    this.GEARS = spec.drivetrain.gears
+    this.FINAL_DRIVE = spec.drivetrain.finalDrive
+    this.DRIVELINE_EFF = spec.drivetrain.efficiency
+    this.REST_LENGTH = spec.suspension.restLength
+    this.MAX_COMPRESSION = spec.suspension.maxCompression
+    this.MAX_DROOP = spec.suspension.maxDroop
+    this.SPRING_K = spec.suspension.springK
+    this.DAMP_COMPRESS = spec.suspension.dampCompress
+    this.DAMP_REBOUND = spec.suspension.dampRebound
+    this.ANTIROLL = spec.suspension.antiRoll
+    this.WHEEL_INERTIA = spec.tyre.wheelInertia
+    this.BASE_MU = spec.tyre.baseMu
+    this.MAX_STEER = (spec.tyre.maxSteerDeg * Math.PI) / 180
+    this.rpm = this.ENGINE_IDLE
+
     const he = model.halfExtents
     const bodyDesc = rapier.RigidBodyDesc.dynamic()
       .setTranslation(spawn.x, spawn.y, spawn.z)
       .setLinearDamping(0.06)
       .setAngularDamping(0.55)
       .setAdditionalMassProperties(
-        MASS,
-        { x: 0, y: 0.72, z: 0 }, // centre of mass sits low for roll stability
-        { x: 4700, y: 4950, z: 980 },
+        this.MASS,
+        // Centre of mass sits low for roll stability.
+        { x: 0, y: spec.comHeight, z: 0 },
+        spec.inertia,
         { x: 0, y: 0, z: 0, w: 1 },
       )
       .setCcdEnabled(true)
@@ -161,8 +190,8 @@ export class Vehicle {
         rig: model.wheels[id],
         omega: 0,
         angle: 0,
-        length: REST_LENGTH,
-        prevLength: REST_LENGTH,
+        length: this.REST_LENGTH,
+        prevLength: this.REST_LENGTH,
         compression: 0,
         load: 0,
         grounded: false,
@@ -180,14 +209,14 @@ export class Vehicle {
   // ------------------------------------------------------------------ helpers
 
   private torqueAt(rpm: number): number {
-    const r = Math.min(ENGINE_REDLINE, Math.max(ENGINE_IDLE, rpm))
-    for (let i = 1; i < TORQUE_RPM.length; i++) {
-      if (r <= TORQUE_RPM[i]) {
-        const t = (r - TORQUE_RPM[i - 1]) / (TORQUE_RPM[i] - TORQUE_RPM[i - 1])
-        return TORQUE_NM[i - 1] + (TORQUE_NM[i] - TORQUE_NM[i - 1]) * t
+    const r = Math.min(this.ENGINE_REDLINE, Math.max(this.ENGINE_IDLE, rpm))
+    for (let i = 1; i < this.TORQUE_RPM.length; i++) {
+      if (r <= this.TORQUE_RPM[i]) {
+        const t = (r - this.TORQUE_RPM[i - 1]) / (this.TORQUE_RPM[i] - this.TORQUE_RPM[i - 1])
+        return this.TORQUE_NM[i - 1] + (this.TORQUE_NM[i] - this.TORQUE_NM[i - 1]) * t
       }
     }
-    return TORQUE_NM[TORQUE_NM.length - 1]
+    return this.TORQUE_NM[this.TORQUE_NM.length - 1]
   }
 
   /**
@@ -265,7 +294,7 @@ export class Vehicle {
     const soil = Math.min(1, softness * tempFactor)
 
     // Speed-sensitive steering, plus a little Ackermann split.
-    const steerLimit = MAX_STEER / (1 + speed * 0.045)
+    const steerLimit = this.MAX_STEER / (1 + speed * 0.045)
     const steerCmd = input.steer * steerLimit
 
     // ------------------------------------------------------ suspension pass
@@ -281,20 +310,20 @@ export class Vehicle {
       const rest = w.rig.restPosition
       // Mount point = wheel centre at rest, raised by the spring's rest length.
       const mx = rest.x
-      const my = rest.y + REST_LENGTH
+      const my = rest.y + this.REST_LENGTH
       const mz = rest.z
       const wx = pos.x + right.x * mx + up.x * my + fwd.x * mz
       const wy = pos.y + right.y * mx + up.y * my + fwd.y * mz
       const wz = pos.z + right.z * mx + up.z * my + fwd.z * mz
 
-      const maxReach = REST_LENGTH + MAX_DROOP + w.rig.radius
+      const maxReach = this.REST_LENGTH + this.MAX_DROOP + w.rig.radius
       const t = this.castGround(wx, wy, wz, -up.x, -up.y, -up.z, maxReach)
 
       const wasGrounded = w.grounded
       w.prevLength = w.length
       if (t < 0) {
         w.grounded = false
-        w.length = REST_LENGTH + MAX_DROOP
+        w.length = this.REST_LENGTH + this.MAX_DROOP
         w.compression = 0
         w.load = 0
         w.sink = 0
@@ -302,8 +331,8 @@ export class Vehicle {
       }
 
       const rawLength = t - w.rig.radius
-      w.length = Math.min(REST_LENGTH + MAX_DROOP, Math.max(REST_LENGTH - MAX_COMPRESSION, rawLength))
-      w.compression = REST_LENGTH - w.length
+      w.length = Math.min(this.REST_LENGTH + this.MAX_DROOP, Math.max(this.REST_LENGTH - this.MAX_COMPRESSION, rawLength))
+      w.compression = this.REST_LENGTH - w.length
       w.grounded = true
       // Touching down after air time: the spring goes from full droop to
       // compressed in one step. Taking that as a damper velocity would produce a
@@ -322,12 +351,12 @@ export class Vehicle {
       // Spring + asymmetric damper. Real dampers see a few m/s; clamping here
       // keeps a single bad step from turning into an impulse.
       const vel = Math.max(-6, Math.min(6, (w.prevLength - w.length) / dt))
-      const damp = vel > 0 ? DAMP_COMPRESS : DAMP_REBOUND
-      let force = SPRING_K * w.compression + damp * vel
+      const damp = vel > 0 ? this.DAMP_COMPRESS : this.DAMP_REBOUND
+      let force = this.SPRING_K * w.compression + damp * vel
       // Bump stop at full compression. Deliberately soft and capped: a wheel that
       // ends up well below the surface must not be pushed out by brute force —
       // that is what the positional recovery below is for.
-      const overlap = REST_LENGTH - MAX_COMPRESSION - rawLength
+      const overlap = this.REST_LENGTH - this.MAX_COMPRESSION - rawLength
       if (overlap > 0) force += Math.min(20000, overlap * 60000)
       // Static load per wheel is ~5 kN. 26 kN absorbs real impacts without
       // letting one corner throw the whole vehicle.
@@ -340,7 +369,7 @@ export class Vehicle {
       const wa = this.wheels[a]
       const wb = this.wheels[b]
       const delta = wa.compression - wb.compression
-      const f = delta * ANTIROLL
+      const f = delta * this.ANTIROLL
       if (wa.grounded) wa.load = Math.max(0, wa.load - f)
       if (wb.grounded) wb.load = Math.max(0, wb.load + f)
     }
@@ -355,15 +384,15 @@ export class Vehicle {
     }
     avgOmega /= driven.length
 
-    const gearRatio = GEARS[this.gearIndex]
+    const gearRatio = this.GEARS[this.gearIndex]
     const inGear = this.gearIndex !== NEUTRAL_INDEX
     if (inGear) {
-      const ratio = Math.abs(gearRatio) * FINAL_DRIVE
-      this.rpm = Math.max(ENGINE_IDLE, Math.abs(avgOmega) * ratio * (60 / (2 * Math.PI)))
+      const ratio = Math.abs(gearRatio) * this.FINAL_DRIVE
+      this.rpm = Math.max(this.ENGINE_IDLE, Math.abs(avgOmega) * ratio * (60 / (2 * Math.PI)))
     } else {
-      this.rpm += (ENGINE_IDLE + input.throttle * 3000 - this.rpm) * Math.min(1, dt * 4)
+      this.rpm += (this.ENGINE_IDLE + input.throttle * 3000 - this.rpm) * Math.min(1, dt * 4)
     }
-    this.rpm = Math.min(this.rpm, ENGINE_REDLINE)
+    this.rpm = Math.min(this.rpm, this.ENGINE_REDLINE)
 
     // Automatic gearbox.
     this.shiftCooldown = Math.max(0, this.shiftCooldown - dt)
@@ -380,7 +409,7 @@ export class Vehicle {
         // Gate upshifts on road speed, not just revs: a bogged truck spins its
         // wheels to the redline while going nowhere, and must not shift up.
         const movingEnough = Math.abs(forwardSpeed) > 2.5
-        if (this.rpm > 5400 && movingEnough && this.gearIndex < GEARS.length - 1) {
+        if (this.rpm > 5400 && movingEnough && this.gearIndex < this.GEARS.length - 1) {
           this.gearIndex++
           this.shiftCooldown = 0.55
         } else if (this.rpm < 1500 && this.gearIndex > FIRST_GEAR_INDEX) {
@@ -396,7 +425,7 @@ export class Vehicle {
     const fuelAvailable = this.fuel > 0
     const engineTorque = fuelAvailable ? this.torqueAt(this.rpm) * input.throttle : 0
     const axleTorque = inGear
-      ? engineTorque * gearRatio * FINAL_DRIVE * DRIVELINE_EFF
+      ? engineTorque * gearRatio * this.FINAL_DRIVE * this.DRIVELINE_EFF
       : 0
     // Open-ish differential: torque splits evenly, so one spinning wheel does
     // rob the others — which is exactly the off-road failure mode we want.
@@ -417,7 +446,7 @@ export class Vehicle {
       if (!w.grounded) {
         // Free-spinning wheel: drive torque only, plus a little drag.
         const tq = (isDriven ? perWheelTorque : 0) - Math.sign(w.omega) * (brakeTorque * (isRear ? 1 : 0.85))
-        w.omega += (tq / WHEEL_INERTIA) * dt
+        w.omega += (tq / this.WHEEL_INERTIA) * dt
         w.omega *= 1 - Math.min(0.5, dt * 0.8)
         w.angle += w.omega * dt
         continue
@@ -456,7 +485,7 @@ export class Vehicle {
       // Grip: mud is slick, and a deeply sunk tyre loses the surface entirely.
       const wetLoss = 1 - tune.humidity * 0.34
       const mudLoss = 1 - w.sink * soil * 0.5
-      const mu = BASE_MU * wetLoss * mudLoss
+      const mu = this.BASE_MU * wetLoss * mudLoss
       const fMax = mu * w.load
 
       // --- drivetrain torque into the wheel, before the tyre reacts ---------
@@ -465,10 +494,10 @@ export class Vehicle {
       if (brakeTorque > 0) {
         const bt = brakeTorque * (isRear ? 1 : 1.15) * (input.handbrake && !isRear ? 0 : 1)
         // Cap the brake so it can never spin the wheel backwards in one step.
-        const stopT = (Math.abs(w.omega) * WHEEL_INERTIA) / dt
+        const stopT = (Math.abs(w.omega) * this.WHEEL_INERTIA) / dt
         brakeT = -Math.sign(w.omega) * Math.min(bt, stopT)
       }
-      w.omega += ((driveT + brakeT) / WHEEL_INERTIA) * dt
+      w.omega += ((driveT + brakeT) / this.WHEEL_INERTIA) * dt
 
       /*
        * Impulse-based tyre. A force-curve model (slip ratio → force) is a stiff
@@ -484,7 +513,7 @@ export class Vehicle {
        */
       const mEff = Math.max(180, w.load / 9.81)
       const slipVel = w.omega * r - vLong
-      const invLong = 1 / mEff + (r * r) / WHEEL_INERTIA
+      const invLong = 1 / mEff + (r * r) / this.WHEEL_INERTIA
       let fLong = slipVel / (dt * invLong)
       let fLat = (-vLat * mEff) / dt
 
@@ -511,7 +540,7 @@ export class Vehicle {
       }
 
       // Tyre reaction back onto the wheel.
-      w.omega -= ((fLong * r) / WHEEL_INERTIA) * dt
+      w.omega -= ((fLong * r) / this.WHEEL_INERTIA) * dt
       // Engine braking / driveline drag when coasting.
       if (input.throttle < 0.02 && inGear) w.omega *= 1 - Math.min(0.4, dt * 1.1)
       w.angle += w.omega * dt
@@ -592,7 +621,7 @@ export class Vehicle {
     }
 
     // Engine temperature: load heats it, airflow and cold ambient cool it.
-    const loadHeat = input.throttle * (this.rpm / ENGINE_REDLINE) * 46
+    const loadHeat = input.throttle * (this.rpm / this.ENGINE_REDLINE) * 46
     const cooling = (this.engineTemp - tune.ambientC) * (0.06 + speed * 0.011)
     this.engineTemp += (loadHeat - cooling) * dt * 0.4
     this.engineTemp = Math.max(tune.ambientC, Math.min(128, this.engineTemp))
@@ -678,7 +707,7 @@ export class Vehicle {
       speedKmh: speed * 3.6,
       rpm: this.rpm,
       gearLabel,
-      awd: true,
+      awd: this.spec.drivetrain.awd,
       fuelPct: this.fuel * 100,
       damagePct: this.damage * 100,
       engineTempC: this.engineTemp,
@@ -714,11 +743,11 @@ export class Vehicle {
     this.body.resetTorques(true)
     for (const w of this.wheels) {
       w.omega = 0
-      w.length = REST_LENGTH
-      w.prevLength = REST_LENGTH
+      w.length = this.REST_LENGTH
+      w.prevLength = this.REST_LENGTH
     }
     this.gearIndex = NEUTRAL_INDEX
-    this.rpm = ENGINE_IDLE
+    this.rpm = this.ENGINE_IDLE
     void this.world
     void this.rapier
   }
