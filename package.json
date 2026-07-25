@@ -32,7 +32,8 @@
       "target": [
         "nsis",
         "portable"
-      ]
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
     },
     "mac": {
       "target": [
@@ -44,8 +45,16 @@
       "target": [
         "AppImage"
       ],
-      "category": "Game"
-    }
+      "category": "Game",
+      "maintainer": "joodretal6-afk"
+    },
+    "publish": null,
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    },
+    "compression": "maximum"
   },
   "dependencies": {
     "@babylonjs/core": "^9.18.0",
@@ -61,9 +70,18 @@
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.0.4",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
     "playwright": "^1.62.0",
     "tailwindcss": "^4.1.14",
     "typescript": "^5.9.3",
     "vite": "^8.1.5"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/joodretal6-afk/cheese-taleb.git"
+  },
+  "author": {
+    "name": "joodretal6-afk"
   }
 }

@@ -1,0 +1,75 @@
+name: Build desktop app
+
+# Builds the installers on GitHub's machines so you can download a ready .exe
+# without installing Node locally. Run it from the Actions tab
+# ("Run workflow"), or push a v* tag to also publish a Release.
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      # One failing platform should not throw away the others' artifacts.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: --win --x64
+            artifact: windows
+          - os: ubuntu-latest
+            target: --linux AppImage
+            artifact: linux
+          - os: macos-latest
+            target: --mac
+            artifact: macos
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Playwright is a dev dependency used only by the headless test harness;
+      # its browser download is a few hundred MB we do not need here.
+      - name: Install dependencies
+        run: npm ci
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build web bundle
+        run: npm run build
+
+      - name: Package desktop app
+        run: npx electron-builder ${{ matrix.target }} --publish never
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mud-terrain-simulator-${{ matrix.artifact }}
+          retention-days: 30
+          # Ship the installers only — not the unpacked app directory, which is
+          # the same bytes again and would double the download.
+          path: |
+            release/*.exe
+            release/*.AppImage
+            release/*.dmg
+            release/*.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.exe
+            release/*.AppImage
+            release/*.dmg
