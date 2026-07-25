@@ -1,0 +1,568 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useSim } from '../store/simStore'
+import { Panel } from './Chrome'
+import { IconAssets, IconCheck, IconClose, IconMountain, IconReset } from './icons'
+import {
+  describeRegion,
+  listRegions,
+  loadRegion,
+  regionSummaryArabic,
+  type RegionStats,
+} from '../engine/region/loadRegion'
+import type { RegionData } from '../engine/region/types'
+import {
+  DEFAULT_PALETTE,
+  parsePalette,
+  serialisePalette,
+  type Palette,
+  type SurfaceKey,
+  type SurfaceStyle,
+} from '../engine/region/palette'
+
+/** Extra load options. Optional on purpose: an engine that ignores them still works. */
+interface RegionLoadOptions {
+  /** OSM maps a single building in this whole square, so they are generated. */
+  buildings: boolean
+  /** Real build progress, so the bar reports the engine instead of guessing. */
+  onStage?(stage: string, fraction: number): void
+}
+
+type SimWindow = Window & {
+  sim?: {
+    /** Takes the already-parsed file, so it is never read twice. */
+    loadRegion?(source: RegionData, palette: Palette, options?: RegionLoadOptions): Promise<void>
+    applyRegionPalette?(palette: Palette): void
+    unloadRegion?(): Promise<void>
+  }
+}
+
+/** Human names for the baked regions; the file only carries the slug. */
+const REGION_LABEL: Record<string, string> = {
+  khalidiya: 'الخالدية — المفرق',
+}
+
+/** Insertion order of DEFAULT_PALETTE is the canonical surface order. */
+const KEYS = Object.keys(DEFAULT_PALETTE) as SurfaceKey[]
+
+/** ODbL floor, shown before any region is loaded so attribution is never absent. */
+const FALLBACK_ATTRIBUTION = '© مساهمو OpenStreetMap (ODbL) · بيانات الارتفاع: AWS Terrain Tiles'
+
+/** DEFAULT_PALETTE is deep-frozen, so every editable copy has to be a real clone. */
+function clonePalette(p: Palette): Palette {
+  const out = {} as Palette
+  for (const k of KEYS) out[k] = { ...p[k] }
+  return out
+}
+
+export function RegionPanel() {
+  const engineReady = useSim((s) => s.engineReady)
+  const generated = useSim((s) => s.generated)
+  // Region state lives in the store: this panel is unmounted every time the
+  // user switches tab, and an unmounted panel would take the palette with it.
+  const region = useSim((s) => s.region)
+  const patchRegion = useSim((s) => s.patchRegion)
+
+  const [names, setNames] = useState<string[]>([])
+  const [name, setName] = useState(region.name)
+  const [buildings, setBuildings] = useState(region.buildings)
+  const [palette, setPalette] = useState<Palette>(
+    () => (region.paletteJson && parsePalette(region.paletteJson)) || clonePalette(DEFAULT_PALETTE),
+  )
+  const [stats, setStats] = useState<RegionStats | null>(null)
+  const attribution = region.attribution
+  const [stage, setStage] = useState<{ label: string; fraction: number } | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [note, setNote] = useState<string | null>(null)
+  const [share, setShare] = useState('')
+  const [picking, setPicking] = useState<SurfaceKey | null>(null)
+  const creepRef = useRef<number | null>(null)
+
+  // Every texture the app has produced so far, newest first. AIPanel already
+  // fills this; PhotoStudio results land here as soon as it pushes them.
+  const library = useMemo(
+    () =>
+      Object.values(generated)
+        .flat()
+        .sort((a, b) => b.createdAt - a.createdAt)
+        .slice(0, 12),
+    [generated],
+  )
+
+  useEffect(() => {
+    let alive = true
+    listRegions()
+      .then((list) => {
+        if (!alive) return
+        setNames(list)
+        setName((n) => n || list[0] || '')
+        if (list.length === 0) setError('لا توجد أي منطقة مبنية داخل التطبيق')
+      })
+      .catch(() => alive && setError('تعذّر البحث عن المناطق المبنية'))
+    return () => {
+      alive = false
+      if (creepRef.current !== null) window.clearInterval(creepRef.current)
+    }
+  }, [])
+
+  function stopCreep() {
+    if (creepRef.current === null) return
+    window.clearInterval(creepRef.current)
+    creepRef.current = null
+  }
+
+  /**
+   * The engine build reports no progress of its own, so the bar eases toward 92%
+   * instead of freezing — an honest "still working", not a fabricated fraction.
+   */
+  function startCreep() {
+    stopCreep()
+    creepRef.current = window.setInterval(() => {
+      setStage((st) => (st ? { ...st, fraction: st.fraction + (0.92 - st.fraction) * 0.07 } : st))
+    }, 140)
+  }
+
+  async function load() {
+    if (!name || stage) return
+    setError(null)
+    setNote(null)
+    setStage({ label: 'قراءة ملف المنطقة', fraction: 0.08 })
+    try {
+      // Relative URL so the packaged file:// desktop build resolves it too.
+      const data = await loadRegion(`regions/${name}.json`)
+      patchRegion({ attribution: data.attribution })
+      setStage({ label: 'حساب الإحصاءات', fraction: 0.25 })
+      setStats(describeRegion(data))
+
+      if (!engineReady) throw new Error('المحرك لم يجهز بعد — انتظر اكتمال تحميل المشهد ثم أعد المحاولة')
+      const build = (window as SimWindow).sim?.loadRegion
+      if (!build) throw new Error('بناء المناطق غير متاح في هذه النسخة من المحرك')
+
+      setStage({ label: 'بناء التضاريس والطرق والمباني', fraction: 0.3 })
+      let reported = false
+      await build(data, palette, {
+        buildings,
+        // The engine names each stage as it reaches it. Only if it says nothing
+        // at all does the bar fall back to easing.
+        onStage: (label, fraction) => {
+          if (!reported) {
+            reported = true
+            stopCreep()
+          }
+          setStage({ label, fraction: 0.3 + fraction * 0.7 })
+        },
+      })
+      if (!reported) startCreep()
+      patchRegion({ name, loaded: true, buildings, paletteJson: serialisePalette(palette) })
+      setNote('تم بناء المنطقة داخل المشهد')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'فشل تحميل المنطقة')
+    } finally {
+      stopCreep()
+      setStage(null)
+    }
+  }
+
+  /** Back to the procedural mud valley the simulator ships with. */
+  async function unload() {
+    if (stage || !region.loaded) return
+    const drop = (window as SimWindow).sim?.unloadRegion
+    if (!drop) {
+      setError('العودة إلى الوادي غير متاحة في هذه النسخة من المحرك')
+      return
+    }
+    setError(null)
+    setNote(null)
+    setStage({ label: 'العودة إلى الوادي الافتراضي', fraction: 0.4 })
+    startCreep()
+    try {
+      await drop()
+      patchRegion({ loaded: false, attribution: null })
+      setStats(null)
+      setNote('تمت العودة إلى الوادي الافتراضي')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'فشلت العودة إلى الوادي')
+    } finally {
+      stopCreep()
+      setStage(null)
+    }
+  }
+
+  /** Colour and roughness edits reach the scene on the spot — no rebuild needed. */
+  function applyLive(next: Palette) {
+    setPalette(next)
+    // Survives the panel being unmounted by a tab switch.
+    patchRegion({ paletteJson: serialisePalette(next) })
+    if (!engineReady) return
+    try {
+      ;(window as SimWindow).sim?.applyRegionPalette?.(next)
+    } catch (err) {
+      console.warn('[ui] applyRegionPalette failed', err)
+    }
+  }
+
+  function setStyle(key: SurfaceKey, patch: Partial<SurfaceStyle>) {
+    const next = clonePalette(palette)
+    next[key] = { ...palette[key], ...patch }
+    applyLive(next)
+  }
+
+  function attachFile(key: SurfaceKey, file: File | undefined) {
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result === 'string') setStyle(key, { textureUrl: reader.result })
+      setPicking(null)
+    }
+    reader.onerror = () => setError('تعذّرت قراءة ملف الصورة')
+    reader.readAsDataURL(file)
+  }
+
+  function exportPalette() {
+    const text = serialisePalette(palette)
+    setShare(text)
+    setNote('تم تصدير الألوان — انسخ النص وشاركه')
+    // Best effort: clipboard access is denied in some embedded contexts.
+    void navigator.clipboard?.writeText(text).catch(() => undefined)
+  }
+
+  function importPalette() {
+    const parsed = parsePalette(share)
+    if (!parsed) {
+      setError('النص المُلصق ليس ملف ألوان صالحاً')
+      return
+    }
+    setError(null)
+    setNote('تم استيراد الألوان وتطبيقها')
+    applyLive(parsed)
+  }
+
+  const busy = stage !== null
+
+  return (
+    <Panel
+      title="منطقة واقعية"
+      className="min-w-0"
+      bodyClassName="min-h-0 overflow-y-auto p-4"
+      actions={
+        <button
+          type="button"
+          title="إعادة الألوان الافتراضية"
+          onClick={() => applyLive(clonePalette(DEFAULT_PALETTE))}
+          className="grid h-7 w-7 place-content-center rounded-md text-mist-400 transition-colors hover:bg-ink-800 hover:text-mist-200"
+        >
+          <IconReset className="h-4 w-4" />
+        </button>
+      }
+    >
+      <div className="flex items-center gap-3">
+        <select
+          className="min-w-0 flex-1 rounded-md border border-ink-600 bg-ink-800 px-2.5 py-1.5 text-[12px] text-mist-200 outline-none focus:border-brand-500"
+          value={name}
+          aria-label="المنطقة"
+          disabled={names.length === 0}
+          onChange={(e) => setName(e.target.value)}
+        >
+          {names.length === 0 && <option value="">لا توجد مناطق</option>}
+          {names.map((n) => (
+            <option key={n} value={n}>
+              {REGION_LABEL[n] ?? n}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          onClick={load}
+          disabled={busy || !name}
+          className="flex shrink-0 items-center gap-2 rounded-lg bg-brand-500 px-3 py-2 text-[12px] font-medium text-white transition-colors hover:bg-brand-400 disabled:opacity-40"
+        >
+          <IconMountain className="h-4 w-4" />
+          {busy ? 'جارٍ التحميل…' : region.loaded ? 'إعادة البناء' : 'تحميل المنطقة'}
+        </button>
+        {region.loaded && (
+          <button
+            type="button"
+            onClick={unload}
+            disabled={busy}
+            title="العودة إلى الوادي الافتراضي"
+            className="grid h-8 w-8 shrink-0 place-content-center rounded-lg border border-ink-600 text-mist-400 transition-colors hover:bg-ink-800 hover:text-mist-200 disabled:opacity-40"
+          >
+            <IconClose className="h-4 w-4" />
+          </button>
+        )}
+      </div>
+
+      <Toggle
+        label="توليد المباني على قطع الأراضي"
+        hint="خرائط OSM تحتوي مبنى واحداً فقط هنا"
+        value={buildings}
+        onChange={setBuildings}
+      />
+
+      {stage && (
+        <div className="mt-2">
+          <div className="mb-1 flex justify-between text-[11px] text-mist-400">
+            <span>{stage.label}</span>
+            <span className="tabular-nums">{Math.round(stage.fraction * 100)}٪</span>
+          </div>
+          <div className="h-1.5 overflow-hidden rounded-full bg-ink-700">
+            <div
+              className="h-full rounded-full bg-linear-to-l from-brand-500 to-accent-500 transition-[width] duration-200"
+              style={{ width: `${Math.round(stage.fraction * 100)}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <p className="mt-2 whitespace-pre-line rounded-lg border border-bad-500/40 bg-bad-500/10 px-3 py-2 text-[11px] leading-5 text-bad-500">
+          {error}
+        </p>
+      )}
+      {note && !error && <p className="mt-2 text-[11px] text-good-500">{note}</p>}
+
+      {stats && (
+        <>
+          <div className="mt-3 grid grid-cols-3 gap-2">
+            <Stat label="المساحة" value={((stats.sizeM * stats.sizeM) / 1e6).toFixed(1)} unit="كم²" />
+            <Stat label="عدد الطرق" value={String(stats.roadCount)} unit="طريق" />
+            <Stat label="أطوال الطرق" value={stats.roadKm.toFixed(1)} unit="كم" />
+            <Stat label="فارق الارتفاع" value={String(Math.round(stats.reliefM))} unit="م" />
+            <Stat label="أشد انحدار" value={stats.steepestRoadGrade.toFixed(1)} unit="٪" />
+            <Stat label="المباني" value={String(stats.buildingCount)} unit="مبنى" />
+          </div>
+
+          <details className="mt-2 rounded-lg border border-ink-700 bg-ink-900/60 px-3 py-2">
+            <summary className="cursor-pointer text-[11px] text-mist-400">الملخص الكامل</summary>
+            <p className="mt-2 whitespace-pre-line text-[11px] leading-5 text-mist-300">
+              {regionSummaryArabic(stats)}
+            </p>
+          </details>
+        </>
+      )}
+
+      <h3 className="mt-4 mb-2 text-[12px] font-medium text-mist-300">ألوان الأسطح</h3>
+      <div className="space-y-1.5">
+        {KEYS.map((key) => (
+          <SurfaceRow
+            key={key}
+            style={palette[key]}
+            open={picking === key}
+            library={library}
+            onTogglePicker={() => setPicking(picking === key ? null : key)}
+            onColor={(color) => setStyle(key, { color })}
+            onRoughness={(roughness) => setStyle(key, { roughness })}
+            onTexture={(textureUrl) => {
+              setStyle(key, { textureUrl })
+              setPicking(null)
+            }}
+            onFile={(file) => attachFile(key, file)}
+          />
+        ))}
+      </div>
+
+      <h3 className="mt-4 mb-2 text-[12px] font-medium text-mist-300">حفظ ومشاركة الألوان</h3>
+      <textarea
+        rows={4}
+        dir="ltr"
+        placeholder='{ "road:major": { … } }'
+        className="w-full resize-y rounded-md border border-ink-600 bg-ink-800 px-2.5 py-2 font-mono text-[10px] leading-4 text-mist-300 outline-none focus:border-brand-500"
+        value={share}
+        aria-label="ألوان المنطقة بصيغة JSON"
+        onChange={(e) => setShare(e.target.value)}
+      />
+      <div className="mt-1.5 flex gap-2">
+        <button
+          type="button"
+          onClick={exportPalette}
+          className="flex-1 rounded-lg bg-ink-700 px-3 py-2 text-[12px] text-mist-200 transition-colors hover:bg-ink-600"
+        >
+          تصدير ونسخ
+        </button>
+        <button
+          type="button"
+          onClick={importPalette}
+          disabled={share.trim().length === 0}
+          className="flex-1 rounded-lg bg-ink-700 px-3 py-2 text-[12px] text-mist-200 transition-colors hover:bg-ink-600 disabled:opacity-40"
+        >
+          استيراد وتطبيق
+        </button>
+      </div>
+
+      {/* ODbL obliges us to credit the source wherever the data is shown. */}
+      <p className="mt-3 border-t border-ink-700 pt-2 text-[10px] leading-4 text-mist-400" dir="auto">
+        {attribution ?? FALLBACK_ATTRIBUTION}
+      </p>
+    </Panel>
+  )
+}
+
+function Stat({ label, value, unit }: { label: string; value: string; unit: string }) {
+  return (
+    <div className="rounded-lg border border-ink-700 bg-ink-900/60 px-2.5 py-2">
+      <div className="text-[10px] text-mist-400">{label}</div>
+      <div className="mt-0.5 flex items-baseline gap-1">
+        <span className="text-[18px] font-semibold tabular-nums text-mist-200">{value}</span>
+        <span className="text-[10px] text-mist-400">{unit}</span>
+      </div>
+    </div>
+  )
+}
+
+function Toggle({
+  label,
+  hint,
+  value,
+  onChange,
+}: {
+  label: string
+  hint: string
+  value: boolean
+  onChange: (v: boolean) => void
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={value}
+      onClick={() => onChange(!value)}
+      className="mt-2 flex w-full items-center gap-3 rounded-lg border border-ink-700 bg-ink-900/60 px-3 py-2 text-start transition-colors hover:border-ink-600"
+    >
+      <span
+        className={`relative h-4 w-8 shrink-0 rounded-full transition-colors ${
+          value ? 'bg-brand-500' : 'bg-ink-600'
+        }`}
+      >
+        <span
+          className={`absolute top-0.5 h-3 w-3 rounded-full bg-white transition-[inset-inline-start] ${
+            value ? 'start-4.5' : 'start-0.5'
+          }`}
+        />
+      </span>
+      <span className="min-w-0">
+        <span className="block text-[12px] text-mist-200">{label}</span>
+        <span className="block text-[10px] text-mist-400">{hint}</span>
+      </span>
+    </button>
+  )
+}
+
+function SurfaceRow({
+  style,
+  open,
+  library,
+  onTogglePicker,
+  onColor,
+  onRoughness,
+  onTexture,
+  onFile,
+}: {
+  style: SurfaceStyle
+  open: boolean
+  library: { id: string; url: string }[]
+  onTogglePicker: () => void
+  onColor: (v: string) => void
+  onRoughness: (v: number) => void
+  onTexture: (url: string | null) => void
+  onFile: (file: File | undefined) => void
+}) {
+  const pct = style.roughness * 100
+  return (
+    <div className="rounded-lg border border-ink-700 bg-ink-900/60 p-2">
+      <div className="flex items-center gap-2">
+        <input
+          type="color"
+          value={style.color}
+          aria-label={`لون ${style.label}`}
+          onChange={(e) => onColor(e.target.value)}
+          className="h-7 w-7 shrink-0 cursor-pointer rounded-md border border-ink-600 bg-ink-800 p-0.5"
+        />
+        <span className="min-w-0 flex-1 truncate text-[12px] text-mist-300">{style.label}</span>
+        <button
+          type="button"
+          onClick={onTogglePicker}
+          title="إرفاق نسيج"
+          className={`grid h-7 w-7 place-content-center overflow-hidden rounded-md border transition-colors ${
+            open ? 'border-brand-500 text-brand-400' : 'border-ink-600 text-mist-400 hover:text-mist-200'
+          }`}
+        >
+          {style.textureUrl ? (
+            <img src={style.textureUrl} alt="" className="h-full w-full object-cover" />
+          ) : (
+            <IconAssets className="h-4 w-4" />
+          )}
+        </button>
+      </div>
+
+      <div className="mt-1.5 flex items-center gap-2">
+        <span className="w-10 shrink-0 text-[11px] text-mist-400">خشونة</span>
+        <input
+          type="range"
+          min={0.04}
+          max={1}
+          step={0.01}
+          value={style.roughness}
+          aria-label={`خشونة ${style.label}`}
+          onChange={(e) => onRoughness(Number(e.target.value))}
+          className="h-4 min-w-0 flex-1"
+          style={{
+            ['--track' as string]: `linear-gradient(to right, var(--color-brand-500) ${pct}%, var(--color-ink-600) ${pct}%)`,
+          }}
+        />
+        <span className="w-8 shrink-0 text-end text-[11px] tabular-nums text-mist-300">
+          {style.roughness.toFixed(2)}
+        </span>
+      </div>
+
+      {open && (
+        <div className="mt-2 border-t border-ink-700 pt-2">
+          {library.length === 0 ? (
+            <p className="text-[10px] text-mist-400">
+              لا توجد أنسجة مولّدة بعد — أنشئ واحداً في استوديو الصور أو اختر ملفاً
+            </p>
+          ) : (
+            <div className="grid grid-cols-6 gap-1.5">
+              {library.map((t) => (
+                <button
+                  key={t.id}
+                  type="button"
+                  onClick={() => onTexture(t.url)}
+                  className={`relative aspect-square overflow-hidden rounded-md border transition-colors ${
+                    t.url === style.textureUrl ? 'border-brand-500' : 'border-ink-600 hover:border-ink-500'
+                  }`}
+                >
+                  <img src={t.url} alt="" className="h-full w-full object-cover" />
+                  {t.url === style.textureUrl && (
+                    <span className="absolute top-0.5 start-0.5 grid h-3.5 w-3.5 place-content-center rounded-full bg-brand-500 text-white">
+                      <IconCheck className="h-2.5 w-2.5" />
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+
+          <div className="mt-2 flex items-center gap-2">
+            <label className="flex-1 cursor-pointer rounded-md bg-ink-700 px-2 py-1.5 text-center text-[11px] text-mist-200 transition-colors hover:bg-ink-600">
+              اختيار ملف صورة
+              <input
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(e) => onFile(e.target.files?.[0])}
+              />
+            </label>
+            <button
+              type="button"
+              onClick={() => onTexture(null)}
+              disabled={!style.textureUrl}
+              title="إزالة النسيج"
+              className="grid h-7 w-7 shrink-0 place-content-center rounded-md bg-ink-700 text-mist-400 transition-colors hover:bg-ink-600 hover:text-mist-200 disabled:opacity-40"
+            >
+              <IconClose className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}

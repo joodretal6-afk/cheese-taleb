@@ -22,6 +22,11 @@ import { Vehicle } from './Vehicle'
 import { loadVehicle, MudCoat, type LoadedVehicle } from './VehicleModel'
 import { Character, type OrientedBox } from './Character'
 import { loadOverrides, overrideSummary, type GroundKind, type OverrideManifest } from './assetOverrides'
+import { RegionScene } from './region/RegionScene'
+import { loadRegion as loadRegionFile } from './region/loadRegion'
+import { buildingBoxes } from './region/collision'
+import { DEFAULT_PALETTE, type Palette } from './region/palette'
+import type { HeightProvider, RegionData } from './region/types'
 import {
   useSim,
   type PlayerMode,
@@ -31,6 +36,31 @@ import {
 
 const WORLD_SIZE = 220
 const MUD_RES = 1024
+/**
+ * Mud texels per side for a baked region. 2048 over 2 km is 98 cm per texel,
+ * against 21 cm for the procedural play area.
+ *
+ * That is the honest trade: a rut is blurrier over a real neighbourhood than
+ * over the test valley, because the same budget is spread over 82 times the
+ * ground. Going further costs memory quadratically — five Float32 fields plus
+ * the RGBA mirror is already ~100 MB at this resolution.
+ */
+const REGION_MUD_RES = 2048
+/** Far plane for a 2 km region; the 220 m valley never needed this much. */
+const REGION_MAX_Z = 3200
+/** Buildings further than this cannot touch the walking player this frame. */
+const BLOCKER_RANGE = 25
+
+/** What landscape the world is built on. */
+type WorldSpec =
+  | { kind: 'procedural' }
+  | {
+      kind: 'region'
+      data: RegionData
+      palette: Palette
+      buildings: boolean
+      onStage?: (stage: string, fraction: number) => void
+    }
 const PHYSICS_DT = 1 / 120
 const MAX_SUBSTEPS = 5
 /** How close to the driver's door you must stand to get in, metres. */
@@ -66,6 +96,8 @@ export class Sim {
   model!: LoadedVehicle
   mudCoat!: MudCoat
   character!: Character
+  /** The baked neighbourhood, once one has been loaded. */
+  region?: RegionScene
   /** Which drop-in assets the user supplied, if any. */
   overrides: OverrideManifest = { ground: {}, props: { tree: null, rock: null } }
   /** Whether the player is driving or walking. */
@@ -73,6 +105,14 @@ export class Sim {
   readonly input = new Input()
   /** Neutral input handed to the truck while the player is walking around. */
   private readonly idleInput = new Input()
+
+  /** Building collision, kept in the character controller's own shape. */
+  private regionBlockers: OrientedBox[] = []
+  private buildingBodies: RAPIER.RigidBody[] = []
+  /** Colours currently dressing the region, so a reload keeps the user's work. */
+  regionPalette: Palette = DEFAULT_PALETTE
+  /** False while the world is being torn down and rebuilt; tick() stands off. */
+  private worldReady = false
 
   private world!: RAPIER.World
   private pipeline?: DefaultRenderingPipeline
@@ -127,27 +167,11 @@ export class Sim {
     this.world = new RAPIER.World({ x: 0, y: -9.81, z: 0 })
     this.world.timestep = PHYSICS_DT
 
-    // --- terrain -----------------------------------------------------------
-    this.field = new MudField({ worldSize: WORLD_SIZE, resolution: MUD_RES, seed: 2024 })
-    store.setLoadProgress(0.3)
-    this.terrain = new Terrain(this.scene, this.field, quality)
-    store.setLoadProgress(0.45)
-
     // --- drop-in assets ------------------------------------------------------
     // Probing is silent: a missing file is the normal case, not a failure.
     this.overrides = await loadOverrides(this.scene)
-    for (const [kind, ov] of Object.entries(this.overrides.ground)) {
-      this.terrain.replaceGroundTexture(kind as GroundKind, ov.albedo, ov.normalHeight)
-    }
     console.info('[assets]', overrideSummary(this.overrides))
-
-    // --- environment -------------------------------------------------------
-    this.environment = new Environment(this.scene, this.field, profile.shadowMap)
-    this.environment.scatterProps(profile.props)
-    // The probe's cube IS scene.environmentTexture, and the terrain material
-    // samples it — putting the terrain in the probe's render list closes a
-    // framebuffer/texture feedback loop. Sky only.
-    store.setLoadProgress(0.55)
+    store.setLoadProgress(0.2)
 
     // --- camera ------------------------------------------------------------
     this.camera = new UniversalCamera('chase', new Vector3(0, 12, -20), this.scene)
@@ -157,32 +181,17 @@ export class Sim {
     this.scene.activeCamera = this.camera
     this.attachCameraControls()
 
-    // --- vehicle -----------------------------------------------------------
+    // --- vehicle model -----------------------------------------------------
+    // Loaded once for the session. Rebuilding the world swaps the landscape
+    // under it, not the truck.
     this.model = await loadVehicle(this.scene, 'models/frontier.glb', (f) =>
-      store.setLoadProgress(0.55 + f * 0.35),
+      store.setLoadProgress(0.2 + f * 0.4),
     )
-    store.setLoadProgress(0.92)
-
-    for (const m of [...this.model.bodyMeshes, ...Object.values(this.model.wheels).flatMap((w) => w.meshes)]) {
-      this.environment.shadows.addShadowCaster(m)
-    }
     this.mudCoat = new MudCoat(this.model)
+    store.setLoadProgress(0.62)
 
-    const spawn = this.findSpawn()
-    this.vehicle = new Vehicle(RAPIER, this.world, this.field, this.model, spawn)
-    // Settle onto the springs before the first frame, so it never appears
-    // hovering — and so a slow machine doesn't spend its first seconds falling.
-    this.warmup(3.5)
-
-    // --- on-foot player ------------------------------------------------------
-    this.character = new Character(this.scene, this.field)
-    // Optional: a rigged character.glb takes over from the procedural figure.
-    await this.character.tryLoadModel(this.scene, 'models/character.glb')
-    for (const m of this.character.root.getChildMeshes()) {
-      this.environment.shadows.addShadowCaster(m)
-    }
-    this.character.placeAt(spawn.x - 2, spawn.z, 0)
-    this.character.setEnabled(false)
+    // --- the world itself ---------------------------------------------------
+    await this.buildWorld({ kind: 'procedural' }, 0.62, 0.96)
 
     // --- post processing ---------------------------------------------------
     this.buildPipeline(profile)
@@ -198,6 +207,266 @@ export class Sim {
 
     this.engine.runRenderLoop(() => this.tick())
     window.addEventListener('resize', this.onResize)
+  }
+
+  // ------------------------------------------------------------------- world
+
+  /**
+   * Build (or rebuild) everything that depends on the landscape.
+   *
+   * The engine, scene, camera, truck model and post-processing chain outlive
+   * this — they are the application. The field, the ground, the sky, the
+   * physics bodies and the two player avatars are the *world*, and swapping a
+   * 220 m test valley for a 2 km neighbourhood means replacing all of them at
+   * once: MudField's world size is compiled into the terrain shader, so it
+   * cannot be resized in place.
+   *
+   * Order is forced by the data. The region has to be assembled first because
+   * its graded height field is what MudField is then built on; the ground mesh
+   * needs the field; the lights need the field to size their cascades; and the
+   * vehicle needs somewhere flat to be put down, which only the region knows.
+   */
+  private async buildWorld(spec: WorldSpec, progressFrom = 0, progressTo = 1) {
+    const store = useSim.getState()
+    const profile = QUALITY[this.appliedQuality]
+    const report = (f: number) =>
+      store.setLoadProgress(progressFrom + (progressTo - progressFrom) * Math.min(1, Math.max(0, f)))
+
+    this.worldReady = false
+
+    // --- tear the old world down --------------------------------------------
+    this.character?.dispose()
+    if (this.vehicle) this.world.removeRigidBody(this.vehicle.body)
+    for (const body of this.buildingBodies) this.world.removeRigidBody(body)
+    this.buildingBodies = []
+    this.regionBlockers = []
+    this.environment?.dispose()
+    this.terrain?.dispose()
+    this.region?.dispose()
+    this.region = undefined
+
+    // --- landscape ----------------------------------------------------------
+    let heightProvider: HeightProvider | undefined
+    let worldSize = WORLD_SIZE
+    let mudRes = MUD_RES
+
+    if (spec.kind === 'region') {
+      const built = await RegionScene.build(this.scene, spec.data, {
+        generateBuildings: spec.buildings,
+        palette: spec.palette,
+        onProgress: (stage, f) => {
+          spec.onStage?.(stage, f)
+          report(f * 0.5)
+        },
+      })
+      this.region = built
+      this.regionPalette = spec.palette
+      heightProvider = built.heightField
+      worldSize = spec.data.sizeM
+      mudRes = REGION_MUD_RES
+      this.camera.maxZ = REGION_MAX_Z
+      console.info('[region]', built.stats.name, `${built.stats.roadKm} km`, `${built.buildings.length} buildings`)
+    } else {
+      this.camera.maxZ = 2200
+    }
+
+    report(0.55)
+    this.field = new MudField({
+      worldSize,
+      resolution: mudRes,
+      seed: 2024,
+      heightProvider,
+    })
+
+    report(0.68)
+    this.terrain = new Terrain(this.scene, this.field, this.appliedQuality)
+    for (const [kind, ov] of Object.entries(this.overrides.ground)) {
+      this.terrain.replaceGroundTexture(kind as GroundKind, ov.albedo, ov.normalHeight)
+    }
+
+    // --- lighting and props ---------------------------------------------------
+    report(0.76)
+    this.environment = new Environment(this.scene, this.field, profile.shadowMap)
+    // A real neighbourhood gets no scattered conifers. What stands between the
+    // houses in Al-Khalidiya is what OSM mapped and what the plot inference
+    // built, not a procedural forest dropped through the roofs.
+    this.environment.scatterProps(spec.kind === 'region' ? 0 : profile.props)
+    this.registerShadowCasters()
+
+    // --- physics for the buildings --------------------------------------------
+    if (this.region) {
+      report(0.82)
+      this.addBuildingColliders()
+    }
+
+    // --- the two avatars -------------------------------------------------------
+    report(0.88)
+    const spawn = this.region ? this.regionSpawn() : this.findSpawn()
+    this.vehicle = new Vehicle(RAPIER, this.world, this.field, this.model, spawn)
+    if (this.region) this.faceVehicle(this.region.findSpawn().yaw)
+    for (const m of [
+      ...this.model.bodyMeshes,
+      ...Object.values(this.model.wheels).flatMap((w) => w.meshes),
+    ]) {
+      this.environment.shadows.addShadowCaster(m)
+    }
+    // Settle onto the springs before the first frame, so it never appears
+    // hovering — and so a slow machine doesn't spend its first seconds falling.
+    this.worldReady = true
+    this.warmup(3.5)
+
+    report(0.94)
+    this.character = new Character(this.scene, this.field)
+    // Optional: a rigged character.glb takes over from the procedural figure.
+    await this.character.tryLoadModel(this.scene, 'models/character.glb')
+    for (const m of this.character.root.getChildMeshes()) {
+      this.environment.shadows.addShadowCaster(m)
+    }
+    this.character.placeAt(spawn.x - 2, spawn.z, 0)
+    this.character.setEnabled(this.mode === 'onfoot')
+
+    // Make the chase camera jump to the new world instead of flying across it.
+    this.camReady = false
+    this.camSnap = true
+    report(1)
+  }
+
+  /**
+   * Load a baked region and rebuild the world on it. This is the entry point
+   * the dashboard's region panel calls.
+   */
+  async loadRegion(
+    source: string | RegionData,
+    palette?: Palette,
+    options?: { buildings?: boolean; onStage?: (stage: string, fraction: number) => void },
+  ): Promise<void> {
+    const store = useSim.getState()
+    // No palette given means "keep what is on screen", so reloading a region
+    // after a rebuild does not throw away the colours the user chose.
+    const dress = palette ?? this.regionPalette
+    // A caller holding the parsed file passes it straight in. The dashboard
+    // does: it reads the statistics and the attribution before the build
+    // starts, and fetching and re-parsing three quarters of a megabyte to
+    // learn the same thing twice is pure waste.
+    // Relative URL so the packaged file:// desktop build resolves it too.
+    const data =
+      typeof source === 'string' ? await loadRegionFile(`regions/${source}.json`) : source
+
+    // Rendering has to stop before the meshes it is drawing are disposed.
+    this.engine.stopRenderLoop()
+    store.setEngineReady(false)
+    store.setLoadProgress(0.02)
+    try {
+      await this.buildWorld({
+        kind: 'region',
+        data,
+        palette: dress,
+        buildings: options?.buildings !== false,
+        onStage: options?.onStage,
+      })
+    } finally {
+      this.engine.runRenderLoop(() => this.tick())
+      store.setLoadProgress(1)
+      store.setEngineReady(true)
+    }
+  }
+
+  /** Recolour and re-texture the region without rebuilding a single vertex. */
+  applyRegionPalette(palette: Palette): void {
+    this.regionPalette = palette
+    this.region?.applyPalette(palette)
+  }
+
+  /** Go back to the procedural mud valley the simulator ships with. */
+  async unloadRegion(): Promise<void> {
+    if (!this.region) return
+    const store = useSim.getState()
+    this.engine.stopRenderLoop()
+    store.setEngineReady(false)
+    store.setLoadProgress(0.02)
+    try {
+      await this.buildWorld({ kind: 'procedural' })
+    } finally {
+      this.engine.runRenderLoop(() => this.tick())
+      store.setLoadProgress(1)
+      store.setEngineReady(true)
+    }
+  }
+
+  /** Sun and moon shadows for whatever the region put on the ground. */
+  private registerShadowCasters() {
+    // Roads are pointedly not casters: a ribbon lying 12 cm above the ground it
+    // follows casts nothing but acne onto itself.
+    for (const mesh of [this.region?.buildingMesh, this.region?.mappedBuildingMesh]) {
+      if (mesh) this.environment.shadows.addShadowCaster(mesh)
+    }
+  }
+
+  /**
+   * Give every building a static box collider and a matching blocker for the
+   * character controller, so a house stops the truck and the player alike
+   * instead of being scenery they drive through.
+   */
+  private addBuildingColliders() {
+    const region = this.region
+    if (!region) return
+    const boxes = buildingBoxes(region.buildings, (x, z) => this.field.baseHeight(x, z))
+
+    for (const b of boxes) {
+      const half = b.height * 0.5
+      const body = this.world.createRigidBody(
+        RAPIER.RigidBodyDesc.fixed()
+          .setTranslation(b.cx, b.baseY + half, b.cz)
+          // Yaw about +Y. Same convention as everywhere else: the angle turns
+          // +Z toward +X, which is what atan2(x, z) measures.
+          .setRotation({ x: 0, y: Math.sin(b.rot * 0.5), z: 0, w: Math.cos(b.rot * 0.5) }),
+      )
+      this.world.createCollider(
+        RAPIER.ColliderDesc.cuboid(b.hx, half, b.hz).setFriction(0.7).setRestitution(0.02),
+        body,
+      )
+      this.buildingBodies.push(body)
+
+      // The character controller works in oriented boxes rather than in Rapier,
+      // so the same footprint goes in twice, in two different shapes.
+      const s = Math.sin(b.rot)
+      const c = Math.cos(b.rot)
+      this.regionBlockers.push({
+        center: new Vector3(b.cx, b.baseY + half, b.cz),
+        half: new Vector3(b.hx, half, b.hz),
+        right: new Vector3(s, 0, c),
+        up: new Vector3(0, 1, 0),
+        forward: new Vector3(-c, 0, s),
+      })
+    }
+  }
+
+  /** Buildings close enough to matter to the walking player this frame. */
+  private nearbyBlockers(): OrientedBox[] {
+    const out: OrientedBox[] = [this.vehicleBox()]
+    if (this.regionBlockers.length === 0) return out
+    const p = this.character.position
+    const r2 = BLOCKER_RANGE * BLOCKER_RANGE
+    for (const b of this.regionBlockers) {
+      const dx = b.center.x - p.x
+      const dz = b.center.z - p.z
+      if (dx * dx + dz * dz <= r2) out.push(b)
+    }
+    return out
+  }
+
+  /** Drop the truck on the street the region picked out for it. */
+  private regionSpawn(): Vector3 {
+    const at = this.region!.findSpawn()
+    const { top } = this.footprint(at.x, at.z)
+    return new Vector3(at.x, top + this.model.wheels.FL.radius + 0.36, at.z)
+  }
+
+  private faceVehicle(yaw: number) {
+    this.vehicle.body.setRotation(
+      { x: 0, y: Math.sin(yaw * 0.5), z: 0, w: Math.cos(yaw * 0.5) },
+      true,
+    )
   }
 
   /** Ground height range under the vehicle's footprint at (x, z). */
@@ -472,7 +741,9 @@ export class Sim {
   // -------------------------------------------------------------------- loop
 
   private tick() {
-    if (this.disposed) return
+    // worldReady is false while buildWorld is between disposing the old world
+    // and finishing the new one. Nothing in here would survive that gap.
+    if (this.disposed || !this.worldReady) return
     const dtRaw = this.engine.getDeltaTime() / 1000
     // A long stall (tab switch, shader compile) must not fast-forward the sim.
     const dt = Math.min(0.05, dtRaw)
@@ -505,7 +776,7 @@ export class Sim {
       if (steps === MAX_SUBSTEPS) this.accumulator = 0
 
       if (onFoot) {
-        this.character.update(dt, this.input, this.camYaw, [this.vehicleBox()])
+        this.character.update(dt, this.input, this.camYaw, this.nearbyBlockers())
       }
 
       this.field.relax(dt, tune.humidity, this.frame)
@@ -578,7 +849,7 @@ export class Sim {
       this.appliedQuality = s.terrainQuality
       const profile = QUALITY[s.terrainQuality]
       this.terrain.setQuality(s.terrainQuality)
-      this.environment.scatterProps(profile.props)
+      this.environment.scatterProps(this.region ? 0 : profile.props)
       this.engine.setHardwareScalingLevel(profile.hardwareScale)
       for (const m of [
         ...this.model.bodyMeshes,
@@ -674,7 +945,9 @@ export class Sim {
     window.removeEventListener('resize', this.onResize)
     this.unsubscribe?.()
     this.input.detach(window)
+    this.worldReady = false
     this.engine?.stopRenderLoop()
+    this.region?.dispose()
     this.pipeline?.dispose()
     this.ssao?.dispose()
     this.character?.dispose()

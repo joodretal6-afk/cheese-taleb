@@ -17,6 +17,10 @@ export function ViewportOverlay() {
   const weather = useSim((s) => s.settings.weather)
   const running = useSim((s) => s.settings.running)
   const set = useSim((s) => s.set)
+  // OpenStreetMap is ODbL: while its data is on screen the credit has to be on
+  // screen with it. That is why this sits on the viewport and not in the region
+  // panel, which is only mounted when its tab happens to be open.
+  const attribution = useSim((s) => (s.region.loaded ? s.region.attribution : null))
 
   return (
     <>
@@ -87,6 +91,12 @@ export function ViewportOverlay() {
         )}
         {' · '}اسحب بالفأرة لتدوير الكاميرا
       </div>
+
+      {attribution && (
+        <div className="pointer-events-none absolute bottom-3 end-3 max-w-[46%] truncate rounded-md bg-ink-950/70 px-2.5 py-1.5 text-[10px] leading-4 text-mist-400 backdrop-blur-sm">
+          {attribution}
+        </div>
+      )}
     </>
   )
 }

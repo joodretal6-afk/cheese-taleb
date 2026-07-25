@@ -2,6 +2,8 @@ node_modules/
 dist/
 release/
 *.tsbuildinfo
+# Throwaway harness output: screenshots and one-off probe scripts.
+scratch/
 .DS_Store
 *.log
 .vite/
