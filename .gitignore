@@ -1,0 +1,12 @@
+node_modules/
+dist/
+release/
+*.tsbuildinfo
+.DS_Store
+*.log
+.vite/
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example

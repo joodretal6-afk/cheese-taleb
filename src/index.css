@@ -1,0 +1,95 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-ink-950: #0b0f17;
+  --color-ink-900: #0f1520;
+  --color-ink-850: #131a26;
+  --color-ink-800: #171f2d;
+  --color-ink-700: #1e2837;
+  --color-ink-600: #2a3646;
+  --color-ink-500: #3a4859;
+  --color-mist-400: #8a97ab;
+  --color-mist-300: #a9b4c6;
+  --color-mist-200: #cbd3e0;
+  --color-brand-500: #6366f1;
+  --color-brand-400: #818cf8;
+  --color-accent-500: #8b5cf6;
+  --color-good-500: #4ade80;
+  --color-warn-500: #fbbf24;
+  --color-bad-500: #f87171;
+
+  --font-sans: 'Segoe UI', 'Tahoma', 'Noto Sans Arabic', system-ui, sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-ink-950);
+  color: var(--color-mist-200);
+  font-family: var(--font-sans);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Thin dark scrollbars so panels don't get chunky OS bars. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-ink-600) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-ink-600);
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Range inputs: the reference uses a slim track with a solid indigo fill. */
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+input[type='range']::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--track, var(--color-ink-600));
+}
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  margin-top: -5px;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: var(--color-brand-400);
+  box-shadow: 0 0 0 3px rgb(99 102 241 / 0.2);
+}
+input[type='range']::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--track, var(--color-ink-600));
+}
+input[type='range']::-moz-range-thumb {
+  border: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: var(--color-brand-400);
+}
+
+canvas {
+  display: block;
+  outline: none;
+  touch-action: none;
+}

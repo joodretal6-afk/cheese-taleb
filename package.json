@@ -1,0 +1,87 @@
+{
+  "name": "mud-terrain-simulator",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Mud Terrain Simulator — browser-based off-road simulation engine + admin dashboard",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "shot": "node scripts/shot.mjs",
+    "desktop:dev": "VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",
+    "desktop:build": "npm run build && electron-builder",
+    "desktop:win": "npm run build && electron-builder --win --x64",
+    "texture-service": "node server/texture-service.mjs",
+    "dev:all": "node server/texture-service.mjs & vite"
+  },
+  "build": {
+    "appId": "com.mudterrain.simulator",
+    "productName": "Mud Terrain Simulator",
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.games"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Game",
+      "maintainer": "joodretal6-afk"
+    },
+    "publish": null,
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    },
+    "compression": "maximum"
+  },
+  "dependencies": {
+    "@babylonjs/core": "^9.18.0",
+    "@babylonjs/loaders": "^9.18.0",
+    "@babylonjs/materials": "^9.18.0",
+    "@dimforge/rapier3d-compat": "^0.19.3",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zustand": "^5.0.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.14",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.4",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
+    "playwright": "^1.62.0",
+    "tailwindcss": "^4.1.14",
+    "typescript": "^5.9.3",
+    "vite": "^8.1.5"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/joodretal6-afk/cheese-taleb.git"
+  },
+  "author": {
+    "name": "joodretal6-afk"
+  }
+}
