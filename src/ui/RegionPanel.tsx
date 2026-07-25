@@ -33,6 +33,7 @@ type SimWindow = Window & {
     loadRegion?(source: RegionData, palette: Palette, options?: RegionLoadOptions): Promise<void>
     applyRegionPalette?(palette: Palette): void
     unloadRegion?(): Promise<void>
+    regionInfo?(): { stats: RegionStats; buildings: number; surfaces: SurfaceKey[] } | null
   }
 }
 
@@ -69,6 +70,10 @@ export function RegionPanel() {
     () => (region.paletteJson && parsePalette(region.paletteJson)) || clonePalette(DEFAULT_PALETTE),
   )
   const [stats, setStats] = useState<RegionStats | null>(null)
+  /** Buildings actually standing in the scene, which is not what the file says. */
+  const [placed, setPlaced] = useState<number | null>(null)
+  /** Keys this region has something to dress. Null until a region is loaded. */
+  const [active, setActive] = useState<SurfaceKey[] | null>(null)
   const attribution = region.attribution
   const [stage, setStage] = useState<{ label: string; fraction: number } | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -155,6 +160,16 @@ export function RegionPanel() {
         },
       })
       if (!reported) startCreep()
+      // Replace the figures read from the file with what the engine actually
+      // built. Two of them differ: the file knows one surveyed building where
+      // thousands now stand, and its steepest gradient is measured on the raw
+      // satellite grid rather than on the graded road the player drives.
+      const info = sim.regionInfo?.()
+      if (info) {
+        setStats(info.stats)
+        setPlaced(info.buildings)
+        setActive(info.surfaces)
+      }
       patchRegion({ name, loaded: true, buildings, paletteJson: serialisePalette(palette) })
       setNote('تم بناء المنطقة داخل المشهد')
     } catch (err) {
@@ -182,6 +197,8 @@ export function RegionPanel() {
       await sim.unloadRegion()
       patchRegion({ loaded: false, attribution: null })
       setStats(null)
+      setPlaced(null)
+      setActive(null)
       setNote('تمت العودة إلى الوادي الافتراضي')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'فشلت العودة إلى الوادي')
@@ -332,7 +349,11 @@ export function RegionPanel() {
             <Stat label="أطوال الطرق" value={stats.roadKm.toFixed(1)} unit="كم" />
             <Stat label="فارق الارتفاع" value={String(Math.round(stats.reliefM))} unit="م" />
             <Stat label="أشد انحدار" value={stats.steepestRoadGrade.toFixed(1)} unit="٪" />
-            <Stat label="المباني" value={String(stats.buildingCount)} unit="مبنى" />
+            <Stat
+              label="المباني"
+              value={String(placed ?? stats.buildingCount)}
+              unit={placed && placed > stats.buildingCount ? `مبنى · ${stats.buildingCount} مرسوم` : 'مبنى'}
+            />
           </div>
 
           <details className="mt-2 rounded-lg border border-ink-700 bg-ink-900/60 px-3 py-2">
@@ -350,6 +371,7 @@ export function RegionPanel() {
           <SurfaceRow
             key={key}
             style={palette[key]}
+            inactive={active !== null && !active.includes(key)}
             open={picking === key}
             library={library}
             onTogglePicker={() => setPicking(picking === key ? null : key)}
@@ -452,6 +474,7 @@ function Toggle({
 
 function SurfaceRow({
   style,
+  inactive,
   open,
   library,
   onTogglePicker,
@@ -461,6 +484,8 @@ function SurfaceRow({
   onFile,
 }: {
   style: SurfaceStyle
+  /** This region contains nothing of this surface, so editing it does nothing. */
+  inactive: boolean
   open: boolean
   library: { id: string; url: string }[]
   onTogglePicker: () => void
@@ -471,7 +496,10 @@ function SurfaceRow({
 }) {
   const pct = style.roughness * 100
   return (
-    <div className="rounded-lg border border-ink-700 bg-ink-900/60 p-2">
+    <div
+      className={`rounded-lg border border-ink-700 bg-ink-900/60 p-2 ${inactive ? 'opacity-45' : ''}`}
+      title={inactive ? 'لا يوجد من هذا السطح شيء في هذه المنطقة' : undefined}
+    >
       <div className="flex items-center gap-2">
         <input
           type="color"
@@ -480,7 +508,10 @@ function SurfaceRow({
           onChange={(e) => onColor(e.target.value)}
           className="h-7 w-7 shrink-0 cursor-pointer rounded-md border border-ink-600 bg-ink-800 p-0.5"
         />
-        <span className="min-w-0 flex-1 truncate text-[12px] text-mist-300">{style.label}</span>
+        <span className="min-w-0 flex-1 truncate text-[12px] text-mist-300">
+          {style.label}
+          {inactive && <span className="ms-1.5 text-[10px] text-mist-500">لا يوجد هنا</span>}
+        </span>
         <button
           type="button"
           onClick={onTogglePicker}

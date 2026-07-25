@@ -47,6 +47,8 @@ export class Terrain {
 
   private readonly scene: Scene
   private readonly field: MudField
+  /** Reused tint buffers, one per ground kind — see tintGround. */
+  private readonly tinted = new Map<GroundKind, Uint8Array>()
 
   // Bound by reference into the shader; mutated each frame from the dashboard.
   private readonly mudParams = new Vector4(0, 0, 0.7, 0.85)
@@ -399,6 +401,64 @@ export class Terrain {
     if (tileMetres && tileMetres > 0) this.tileScale = 1 / tileMetres
     // Force a re-bind so the change shows without waiting for a define change.
     this.material.markAsDirty(Material.TextureDirtyFlag)
+  }
+
+  /**
+   * Recolour one of the four ground materials, keeping its grain.
+   *
+   * A flat colour would erase the procedural detail that makes the ground read
+   * as soil rather than as a painted plane, so each texel is rescaled about the
+   * texture's own mean instead: the result averages to exactly the colour asked
+   * for, while every bump, speck and streak survives at the same relative
+   * strength. Same trick the region uses to keep per-house colour variety under
+   * a changed building colour.
+   *
+   * Cheap enough to call on every slider drag — one 512² pass, no reallocation
+   * after the first call for a given kind.
+   */
+  tintGround(kind: GroundKind, r: number, g: number, b: number) {
+    const set = this.library[kind]
+    const src = set.albedoData
+    const n = set.size * set.size
+
+    let mr = 0
+    let mg = 0
+    let mb = 0
+    for (let i = 0; i < n; i++) {
+      mr += src[i * 4]
+      mg += src[i * 4 + 1]
+      mb += src[i * 4 + 2]
+    }
+    // Guard a black source: dividing by its mean would be a division by zero.
+    mr = Math.max(1, mr / n)
+    mg = Math.max(1, mg / n)
+    mb = Math.max(1, mb / n)
+
+    let out = this.tinted.get(kind)
+    if (!out) {
+      out = new Uint8Array(src.length)
+      this.tinted.set(kind, out)
+    }
+    const kr = (r * 255) / mr
+    const kg = (g * 255) / mg
+    const kb = (b * 255) / mb
+    for (let i = 0; i < n; i++) {
+      const o = i * 4
+      const vr = src[o] * kr
+      const vg = src[o + 1] * kg
+      const vb = src[o + 2] * kb
+      out[o] = vr > 255 ? 255 : vr
+      out[o + 1] = vg > 255 ? 255 : vg
+      out[o + 2] = vb > 255 ? 255 : vb
+      out[o + 3] = src[o + 3]
+    }
+    set.albedo.update(out)
+  }
+
+  /** Put a ground material back to the colour it was generated with. */
+  resetGroundTint(kind: GroundKind) {
+    const set = this.library[kind]
+    set.albedo.update(set.albedoData)
   }
 
   /** Copy the live dashboard values into the uniforms bound by reference. */

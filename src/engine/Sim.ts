@@ -29,9 +29,9 @@ import {
 import { Character, type OrientedBox } from './Character'
 import { loadOverrides, overrideSummary, type GroundKind, type OverrideManifest } from './assetOverrides'
 import { RegionScene } from './region/RegionScene'
-import { loadRegion as loadRegionFile } from './region/loadRegion'
+import { loadRegion as loadRegionFile, type RegionStats } from './region/loadRegion'
 import { buildingBoxes } from './region/collision'
-import { DEFAULT_PALETTE, type Palette } from './region/palette'
+import { DEFAULT_PALETTE, type Palette, type SurfaceKey } from './region/palette'
 import type { HeightProvider, RegionData } from './region/types'
 import {
   useSim,
@@ -378,6 +378,10 @@ export class Sim {
       this.terrain.replaceGroundTexture(kind as GroundKind, ov.albedo, ov.normalHeight)
     }
 
+    // The ground half of the palette lives on Terrain, not on RegionScene, so
+    // it has to be re-applied whenever Terrain is rebuilt.
+    if (spec.kind === 'region') this.applyGroundPalette(spec.palette)
+
     // --- lighting and props ---------------------------------------------------
     report(0.76)
     this.environment = new Environment(this.scene, this.field, profile.shadowMap)
@@ -465,10 +469,76 @@ export class Sim {
     }
   }
 
+  /**
+   * What actually got built, for the dashboard to report.
+   *
+   * The panel can compute statistics from the file on its own, but two of them
+   * come out wrong that way. The building count in the file is the number OSM
+   * surveyed — one — while the number standing in the scene is two and a half
+   * thousand. And the steepest gradient measured on the raw satellite grid is
+   * 40%, while the road the player actually drives was graded down to 29%.
+   * Reporting the file would be describing something other than the world.
+   */
+  regionInfo(): { stats: RegionStats; buildings: number; surfaces: SurfaceKey[] } | null {
+    if (!this.region) return null
+    return {
+      stats: this.region.stats,
+      buildings: this.region.buildings.length,
+      // The ground three are always live: Terrain owns them and Terrain always
+      // exists, whatever classes of road the region happens to contain.
+      surfaces: [
+        ...this.region.activeSurfaceKeys(),
+        'ground:bare',
+        'ground:rock',
+        'ground:vegetation',
+      ],
+    }
+  }
+
   /** Recolour and re-texture the region without rebuilding a single vertex. */
   applyRegionPalette(palette: Palette): void {
     this.regionPalette = palette
     this.region?.applyPalette(palette)
+    this.applyGroundPalette(palette)
+  }
+
+  /**
+   * The three ground entries in the palette.
+   *
+   * RegionScene owns the roads and the buildings, but not the ground — that is
+   * Terrain's procedural shader, which existed long before regions did and is
+   * shared with the mud valley. So these three keys have to be applied here, or
+   * they do nothing at all, which is exactly what they did before this.
+   *
+   * A key left at its default colour is put back to the generated texture
+   * rather than tinted to an almost-identical one, so an untouched palette
+   * leaves the ground looking exactly as it was authored.
+   */
+  private applyGroundPalette(palette: Palette): void {
+    if (!this.terrain) return
+    const MAP: [SurfaceKey, GroundKind][] = [
+      ['ground:bare', 'dirt'],
+      ['ground:rock', 'rock'],
+      ['ground:vegetation', 'grass'],
+    ]
+    for (const [key, kind] of MAP) {
+      const style = palette[key] ?? DEFAULT_PALETTE[key]
+      // A user-supplied image wins over any colour: it is the real surface.
+      if (style.textureUrl) {
+        const tex = new Texture(style.textureUrl, this.scene)
+        this.terrain.replaceGroundTexture(kind, tex, null, style.tileMetres)
+        continue
+      }
+      // Drop-in files from public/textures/ are the user's art too — do not
+      // paint over one just because the palette carries a default colour.
+      if (this.overrides.ground[kind]) continue
+      if (style.color.toLowerCase() === DEFAULT_PALETTE[key].color.toLowerCase()) {
+        this.terrain.resetGroundTint(kind)
+        continue
+      }
+      const c = Color3.FromHexString(style.color)
+      this.terrain.tintGround(kind, c.r, c.g, c.b)
+    }
   }
 
   /** Go back to the procedural mud valley the simulator ships with. */
