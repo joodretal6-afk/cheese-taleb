@@ -5,6 +5,7 @@ import {
   Engine,
   ImageProcessingConfiguration,
   PBRMaterial,
+  Quaternion,
   Scene,
   SSAO2RenderingPipeline,
   Scalar,
@@ -19,12 +20,20 @@ import { Environment } from './Environment'
 import { Input } from './Input'
 import { Vehicle } from './Vehicle'
 import { loadVehicle, MudCoat, type LoadedVehicle } from './VehicleModel'
-import { useSim, type SimSettings, type TerrainQuality } from '../store/simStore'
+import { Character, type OrientedBox } from './Character'
+import {
+  useSim,
+  type PlayerMode,
+  type SimSettings,
+  type TerrainQuality,
+} from '../store/simStore'
 
 const WORLD_SIZE = 220
 const MUD_RES = 1024
 const PHYSICS_DT = 1 / 120
 const MAX_SUBSTEPS = 5
+/** How close to the driver's door you must stand to get in, metres. */
+const ENTER_RANGE = 3.2
 
 interface QualityProfile {
   shadowMap: number
@@ -55,7 +64,12 @@ export class Sim {
   vehicle!: Vehicle
   model!: LoadedVehicle
   mudCoat!: MudCoat
+  character!: Character
+  /** Whether the player is driving or walking. */
+  mode: PlayerMode = 'driving'
   readonly input = new Input()
+  /** Neutral input handed to the truck while the player is walking around. */
+  private readonly idleInput = new Input()
 
   private world!: RAPIER.World
   private pipeline?: DefaultRenderingPipeline
@@ -75,6 +89,7 @@ export class Sim {
   private readonly camTarget = new Vector3()
   private dragging = false
   private camReady = false
+  private camSnap = false
   private lastPointer = { x: 0, y: 0 }
 
   constructor(canvas: HTMLCanvasElement) {
@@ -147,6 +162,16 @@ export class Sim {
     // Settle onto the springs before the first frame, so it never appears
     // hovering — and so a slow machine doesn't spend its first seconds falling.
     this.warmup(3.5)
+
+    // --- on-foot player ------------------------------------------------------
+    this.character = new Character(this.scene, this.field)
+    // Optional: a rigged character.glb takes over from the procedural figure.
+    await this.character.tryLoadModel(this.scene, 'models/character.glb')
+    for (const m of this.character.root.getChildMeshes()) {
+      this.environment.shadows.addShadowCaster(m)
+    }
+    this.character.placeAt(spawn.x - 2, spawn.z, 0)
+    this.character.setEnabled(false)
 
     // --- post processing ---------------------------------------------------
     this.buildPipeline(profile)
@@ -288,10 +313,24 @@ export class Sim {
   }
 
   private updateCamera(dt: number) {
+    // The camera follows whatever the player is currently controlling. On foot
+    // it sits closer and lower, and never auto-swings behind the direction of
+    // travel — strafing round an object should not spin the view.
+    const onFoot = this.mode === 'onfoot'
     const body = this.vehicle.body
-    const t = body.translation()
-    const v = body.linvel()
+    const bt = body.translation()
+    const bv = body.linvel()
+
+    const t = onFoot
+      ? { x: this.character.position.x, y: this.character.position.y, z: this.character.position.z }
+      : { x: bt.x, y: bt.y, z: bt.z }
+    const v = onFoot
+      ? { x: this.character.velocity.x, y: 0, z: this.character.velocity.z }
+      : { x: bv.x, y: bv.y, z: bv.z }
     const speed = Math.hypot(v.x, v.z)
+    const eye = onFoot ? this.character.config.height * 0.78 : 1.15
+    const lift = onFoot ? 0.9 : 2.4
+    const baseDist = onFoot ? Math.min(this.camDist, 5.2) : this.camDist
 
     // First frame: snap instead of lerping from the origin. Letting the smoothed
     // position and target start equal makes TargetCamera.setTarget build a
@@ -299,17 +338,17 @@ export class Sim {
     // — the camera then renders nothing for the rest of the session.
     if (!this.camReady) {
       this.camReady = true
-      this.camTarget.copyFromFloats(t.x, t.y + 1.15, t.z)
+      this.camTarget.copyFromFloats(t.x, t.y + eye, t.z)
       const cp0 = Math.cos(this.camPitch)
       this.camPos.copyFromFloats(
-        t.x + Math.sin(this.camYaw) * cp0 * this.camDist,
-        t.y + 2.4 + Math.sin(this.camPitch) * this.camDist,
-        t.z + Math.cos(this.camYaw) * cp0 * this.camDist,
+        t.x + Math.sin(this.camYaw) * cp0 * baseDist,
+        t.y + lift + Math.sin(this.camPitch) * baseDist,
+        t.z + Math.cos(this.camYaw) * cp0 * baseDist,
       )
     }
 
-    // Ease the camera behind the direction of travel when moving.
-    if (!this.dragging && speed > 2.2) {
+    // Ease the camera behind the direction of travel when driving.
+    if (!onFoot && !this.dragging && speed > 2.2) {
       const travelYaw = Math.atan2(v.x, v.z) + Math.PI
       let delta = travelYaw - this.camYaw
       while (delta > Math.PI) delta -= Math.PI * 2
@@ -317,23 +356,26 @@ export class Sim {
       this.camYaw += delta * Math.min(1, dt * 1.6)
     }
 
-    const dist = this.camDist + Math.min(4.5, speed * 0.18)
+    const dist = baseDist + (onFoot ? 0 : Math.min(4.5, speed * 0.18))
     const cp = Math.cos(this.camPitch)
     const desiredX = t.x + Math.sin(this.camYaw) * cp * dist
     const desiredZ = t.z + Math.cos(this.camYaw) * cp * dist
-    const desiredY = t.y + 2.4 + Math.sin(this.camPitch) * dist
+    const desiredY = t.y + lift + Math.sin(this.camPitch) * dist
 
     // Don't let the camera drop under the ground.
-    const groundY = this.field.surfaceHeight(desiredX, desiredZ) + 1.1
+    const groundY = this.field.surfaceHeight(desiredX, desiredZ) + (onFoot ? 0.5 : 1.1)
     const clampedY = Math.max(desiredY, groundY)
 
-    const k = Math.min(1, dt * 7)
+    // Snap rather than glide when the player just swapped between the truck and
+    // walking — easing across a 3 m jump looks like the camera slid off.
+    const k = this.camSnap ? 1 : Math.min(1, dt * 7)
+    this.camSnap = false
     this.camPos.x += (desiredX - this.camPos.x) * k
     this.camPos.y += (clampedY - this.camPos.y) * k
     this.camPos.z += (desiredZ - this.camPos.z) * k
 
     this.camTarget.x += (t.x - this.camTarget.x) * k
-    this.camTarget.y += (t.y + 1.15 - this.camTarget.y) * k
+    this.camTarget.y += (t.y + eye - this.camTarget.y) * k
     this.camTarget.z += (t.z - this.camTarget.z) * k
 
     this.camera.position.copyFrom(this.camPos)
@@ -344,8 +386,76 @@ export class Sim {
     this.camera.setTarget(this.camTarget)
 
     // Speed-sensitive FOV adds a sense of pace without touching the geometry.
-    const targetFov = 0.85 + Math.min(0.16, speed * 0.006)
+    const targetFov = 0.85 + (onFoot ? 0 : Math.min(0.16, speed * 0.006))
     this.camera.fov += (targetFov - this.camera.fov) * Math.min(1, dt * 3)
+  }
+
+  // ------------------------------------------------------------ enter / exit
+
+  /** Driver's door in world space — the point you get in and out at. */
+  private doorPoint(): Vector3 {
+    const t = this.vehicle.body.translation()
+    const r = this.vehicle.body.rotation()
+    const q = new Quaternion(r.x, r.y, r.z, r.w)
+    // Left side of the cab, a step out from the sill.
+    const local = new Vector3(-(this.model.halfExtents.x + 0.75), 0, 0.6)
+    local.applyRotationQuaternionInPlace(q)
+    return new Vector3(t.x + local.x, t.y, t.z + local.z)
+  }
+
+  /** The truck as an oriented box, so the character can't walk through it. */
+  private vehicleBox(): OrientedBox {
+    const t = this.vehicle.body.translation()
+    const r = this.vehicle.body.rotation()
+    const q = new Quaternion(r.x, r.y, r.z, r.w)
+    const right = new Vector3(1, 0, 0)
+    const up = new Vector3(0, 1, 0)
+    const forward = new Vector3(0, 0, 1)
+    right.applyRotationQuaternionInPlace(q)
+    up.applyRotationQuaternionInPlace(q)
+    forward.applyRotationQuaternionInPlace(q)
+    const he = this.model.halfExtents
+    const centre = new Vector3(t.x, t.y, t.z).add(up.scale(1.0))
+    return {
+      center: centre,
+      half: new Vector3(he.x * 0.92, 0.85, he.z * 0.94),
+      right,
+      up,
+      forward,
+    }
+  }
+
+  private distanceToVehicle(): number {
+    const p = this.character.position
+    const d = this.doorPoint()
+    return Math.hypot(p.x - d.x, p.z - d.z)
+  }
+
+  /** Toggle between driving and walking. Returns true if the mode changed. */
+  toggleVehicle(): boolean {
+    if (this.mode === 'driving') {
+      const door = this.doorPoint()
+      // Step out beside the door, on top of whatever the ground is doing there.
+      this.character.placeAt(door.x, door.z, this.characterYawFromVehicle() + Math.PI * 0.5)
+      this.character.setEnabled(true)
+      this.mode = 'onfoot'
+      this.camSnap = true
+      return true
+    }
+    // Only get in if we're actually standing next to the door.
+    if (this.distanceToVehicle() > ENTER_RANGE) return false
+    this.character.setEnabled(false)
+    this.mode = 'driving'
+    this.camSnap = true
+    return true
+  }
+
+  private characterYawFromVehicle(): number {
+    const r = this.vehicle.body.rotation()
+    const q = new Quaternion(r.x, r.y, r.z, r.w)
+    const fwd = new Vector3(0, 0, 1)
+    fwd.applyRotationQuaternionInPlace(q)
+    return Math.atan2(fwd.x, fwd.z)
   }
 
   // -------------------------------------------------------------------- loop
@@ -359,6 +469,9 @@ export class Sim {
 
     this.input.update(dt)
     if (this.input.consumePress('KeyR')) this.vehicle.reset()
+    if (settings.running && this.input.consumePress('KeyF')) this.toggleVehicle()
+
+    const onFoot = this.mode === 'onfoot'
 
     if (settings.running) {
       this.accumulator += dt
@@ -369,13 +482,20 @@ export class Sim {
         ambientC: -10 + settings.temperature * 55,
         awd: true,
       }
+      // A parked truck still needs stepping so it settles and stays put, but it
+      // must not react to the keys the player is walking around with.
+      const vehicleInput = onFoot ? this.idleInput : this.input
       while (this.accumulator >= PHYSICS_DT && steps < MAX_SUBSTEPS) {
-        this.vehicle.step(PHYSICS_DT, this.input, tune)
+        this.vehicle.step(PHYSICS_DT, vehicleInput, tune)
         this.world.step()
         this.accumulator -= PHYSICS_DT
         steps++
       }
       if (steps === MAX_SUBSTEPS) this.accumulator = 0
+
+      if (onFoot) {
+        this.character.update(dt, this.input, this.camYaw, [this.vehicleBox()])
+      }
 
       this.field.relax(dt, tune.humidity, this.frame)
     }
@@ -410,6 +530,13 @@ export class Sim {
         engineTempC: Math.round(tel.engineTempC),
         wheelSink: tel.wheelSink,
         bodyMud: tel.bodyMud,
+        mode: this.mode,
+        footSpeedKmh: onFoot
+          ? Math.round(
+              Math.hypot(this.character.velocity.x, this.character.velocity.z) * 3.6,
+            )
+          : 0,
+        canEnterVehicle: onFoot && this.distanceToVehicle() <= ENTER_RANGE,
       })
     }
 
@@ -524,6 +651,7 @@ export class Sim {
     this.engine?.stopRenderLoop()
     this.pipeline?.dispose()
     this.ssao?.dispose()
+    this.character?.dispose()
     this.environment?.dispose()
     this.terrain?.dispose()
     this.scene?.dispose()

@@ -11,6 +11,9 @@ const WEATHER: { id: WeatherKind; label: string; Icon: typeof IconSun }[] = [
 /** FPS badge and weather switcher floating over the 3D canvas. */
 export function ViewportOverlay() {
   const fps = useSim((s) => s.telemetry.fps)
+  const mode = useSim((s) => s.telemetry.mode)
+  const footSpeed = useSim((s) => s.telemetry.footSpeedKmh)
+  const canEnter = useSim((s) => s.telemetry.canEnterVehicle)
   const weather = useSim((s) => s.settings.weather)
   const running = useSim((s) => s.settings.running)
   const set = useSim((s) => s.set)
@@ -21,10 +24,16 @@ export function ViewportOverlay() {
         <span className="rounded-md bg-ink-950/75 px-2.5 py-1 text-[11px] font-medium tabular-nums text-mist-200 backdrop-blur-sm">
           FPS: {fps}
         </span>
-        {!running && (
+        {!running ? (
           <span className="rounded-md bg-ink-950/75 px-2.5 py-1 text-[11px] text-mist-400 backdrop-blur-sm">
             متوقفة — اضغط «بدء المحاكاة»
           </span>
+        ) : (
+          mode === 'onfoot' && (
+            <span className="rounded-md bg-brand-500/85 px-2.5 py-1 text-[11px] font-medium text-white backdrop-blur-sm">
+              على الأقدام · {footSpeed} km/h
+            </span>
+          )
         )}
       </div>
 
@@ -56,9 +65,27 @@ export function ViewportOverlay() {
         </div>
       </div>
 
+      {/* Contextual prompt: only shown when pressing F would actually do something. */}
+      {running && (mode === 'driving' || canEnter) && (
+        <div className="pointer-events-none absolute bottom-14 left-1/2 -translate-x-1/2 rounded-lg bg-ink-950/85 px-3 py-1.5 text-[12px] text-mist-200 backdrop-blur-sm">
+          <kbd className="me-1.5 rounded bg-ink-700 px-1.5 py-0.5 text-[11px] font-semibold">F</kbd>
+          {mode === 'driving' ? 'للنزول من المركبة' : 'للركوب'}
+        </div>
+      )}
+
       <div className="pointer-events-none absolute bottom-3 start-3 rounded-md bg-ink-950/70 px-2.5 py-1.5 text-[10.5px] leading-4 text-mist-400 backdrop-blur-sm">
-        <span dir="ltr">W A S D</span> للقيادة · <span dir="ltr">Space</span> مكابح اليد ·{' '}
-        <span dir="ltr">R</span> إعادة · اسحب بالفأرة لتدوير الكاميرا
+        {mode === 'driving' ? (
+          <>
+            <span dir="ltr">W A S D</span> للقيادة · <span dir="ltr">Space</span> مكابح اليد ·{' '}
+            <span dir="ltr">F</span> نزول · <span dir="ltr">R</span> إعادة
+          </>
+        ) : (
+          <>
+            <span dir="ltr">W A S D</span> للمشي · <span dir="ltr">Shift</span> جري ·{' '}
+            <span dir="ltr">Space</span> قفز · <span dir="ltr">F</span> ركوب
+          </>
+        )}
+        {' · '}اسحب بالفأرة لتدوير الكاميرا
       </div>
     </>
   )

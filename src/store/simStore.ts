@@ -1,6 +1,8 @@
 import { create } from 'zustand'
 
 export type WeatherKind = 'clear' | 'rain' | 'overcast' | 'snow'
+/** Whether the player is behind the wheel or walking around. */
+export type PlayerMode = 'driving' | 'onfoot'
 export type TerrainQuality = 'low' | 'medium' | 'high' | 'ultra'
 
 /** Knobs the dashboard exposes. The engine subscribes and applies them live. */
@@ -33,6 +35,11 @@ export interface Telemetry {
   wheelSink: [number, number, number, number]
   /** 0..1, how much mud is caked onto the body. */
   bodyMud: number
+  mode: PlayerMode
+  /** On-foot speed, km/h — 0 while driving. */
+  footSpeedKmh: number
+  /** True when the player is close enough to get in. */
+  canEnterVehicle: boolean
 }
 
 export interface VehiclePart {
@@ -136,6 +143,9 @@ export const useSim = create<SimState>((set) => ({
     engineTempC: 62,
     wheelSink: [0, 0, 0, 0],
     bodyMud: 0,
+    mode: 'driving',
+    footSpeedKmh: 0,
+    canEnterVehicle: false,
   },
   parts: PARTS,
   selectedPartId: 'door-fr',

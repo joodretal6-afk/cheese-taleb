@@ -1,9 +1,17 @@
-/** Keyboard + gamepad driving input, normalised to -1..1 / 0..1 axes. */
+/** Keyboard + gamepad input, normalised to -1..1 / 0..1 axes. */
 export class Input {
+  // --- driving ---
   throttle = 0
   brake = 0
   steer = 0
   handbrake = false
+
+  // --- on foot --- (raw axes, resolved against the camera by the character)
+  moveForward = 0
+  moveRight = 0
+  running = false
+  /** True for the frame the jump key went down. */
+  jump = false
 
   /** Edge-triggered actions consumed by the sim once per press. */
   private pressed = new Set<string>()
@@ -66,14 +74,26 @@ export class Input {
     this.throttle = fwd ? 1 : 0
     this.brake = back ? 1 : 0
 
+    // On foot the same keys are raw movement axes rather than pedals.
+    this.moveForward = (fwd ? 1 : 0) - (back ? 1 : 0)
+    this.moveRight = (right ? 1 : 0) - (left ? 1 : 0)
+    this.running = this.held.has('ShiftLeft') || this.held.has('ShiftRight')
+    this.jump = this.consumePress('Space')
+
     const pads = navigator.getGamepads?.() ?? []
     for (const pad of pads) {
       if (!pad) continue
       const ax = pad.axes[0] ?? 0
-      if (Math.abs(ax) > 0.12) this.steer = ax
+      const ay = pad.axes[1] ?? 0
+      if (Math.abs(ax) > 0.12) {
+        this.steer = ax
+        this.moveRight = ax
+      }
+      if (Math.abs(ay) > 0.12) this.moveForward = -ay
       this.throttle = Math.max(this.throttle, pad.buttons[7]?.value ?? 0)
       this.brake = Math.max(this.brake, pad.buttons[6]?.value ?? 0)
       this.handbrake = this.handbrake || !!pad.buttons[0]?.pressed
+      this.running = this.running || !!pad.buttons[10]?.pressed
       break
     }
   }
@@ -83,4 +103,5 @@ const RELEVANT = new Set([
   'KeyW', 'KeyA', 'KeyS', 'KeyD',
   'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
   'Space', 'KeyR', 'KeyC', 'KeyF', 'KeyH',
+  'ShiftLeft', 'ShiftRight',
 ])
