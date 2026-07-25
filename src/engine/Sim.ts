@@ -145,6 +145,18 @@ export class Sim {
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas
+    /*
+     * `window.sim` is a public surface, and the natural way to feature-detect a
+     * method on it is `const f = sim.loadRegion; if (f) f(...)`. That detaches
+     * the method: `this` is undefined inside it and the first field it touches
+     * throws "Cannot read properties of undefined". The call sites are written
+     * to go through the object, but binding here means the surface cannot be
+     * misused that way at all.
+     */
+    this.loadRegion = this.loadRegion.bind(this)
+    this.unloadRegion = this.unloadRegion.bind(this)
+    this.applyRegionPalette = this.applyRegionPalette.bind(this)
+    this.setVehicle = this.setVehicle.bind(this)
   }
 
   async boot() {

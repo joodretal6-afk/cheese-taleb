@@ -134,12 +134,15 @@ export function RegionPanel() {
       setStats(describeRegion(data))
 
       if (!engineReady) throw new Error('المحرك لم يجهز بعد — انتظر اكتمال تحميل المشهد ثم أعد المحاولة')
-      const build = (window as SimWindow).sim?.loadRegion
-      if (!build) throw new Error('بناء المناطق غير متاح في هذه النسخة من المحرك')
+      // Feature-detect on the object, then call THROUGH it. Pulling the method
+      // out into a variable and calling that detaches it from the Sim instance,
+      // so `this` is undefined inside and the first field it touches throws.
+      const sim = (window as SimWindow).sim
+      if (!sim?.loadRegion) throw new Error('بناء المناطق غير متاح في هذه النسخة من المحرك')
 
       setStage({ label: 'بناء التضاريس والطرق والمباني', fraction: 0.3 })
       let reported = false
-      await build(data, palette, {
+      await sim.loadRegion(data, palette, {
         buildings,
         // The engine names each stage as it reaches it. Only if it says nothing
         // at all does the bar fall back to easing.
@@ -165,8 +168,9 @@ export function RegionPanel() {
   /** Back to the procedural mud valley the simulator ships with. */
   async function unload() {
     if (stage || !region.loaded) return
-    const drop = (window as SimWindow).sim?.unloadRegion
-    if (!drop) {
+    // Called through `sim`, never as a detached reference — see load().
+    const sim = (window as SimWindow).sim
+    if (!sim?.unloadRegion) {
       setError('العودة إلى الوادي غير متاحة في هذه النسخة من المحرك')
       return
     }
@@ -175,7 +179,7 @@ export function RegionPanel() {
     setStage({ label: 'العودة إلى الوادي الافتراضي', fraction: 0.4 })
     startCreep()
     try {
-      await drop()
+      await sim.unloadRegion()
       patchRegion({ loaded: false, attribution: null })
       setStats(null)
       setNote('تمت العودة إلى الوادي الافتراضي')

@@ -113,12 +113,14 @@ export function SimSettings() {
     const previous = carId
     setCarId(id)
     setCarNote(null)
-    const swap = (window as SimWindow).sim?.setVehicle
-    if (!swap) {
+    // Called through `sim`: a detached method reference loses `this` and the
+    // first field the method touches throws.
+    const sim = (window as SimWindow).sim
+    if (!sim?.setVehicle) {
       setCarId(previous)
       return
     }
-    const ok = await swap(id)
+    const ok = await sim.setVehicle(id)
     if (!ok) {
       setCarId(previous)
       setCarNote(`${getVehicle(id).modelUrl} غير موجود — ضع الملف في public/models/`)
