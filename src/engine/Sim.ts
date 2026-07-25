@@ -32,6 +32,8 @@ import { RegionScene } from './region/RegionScene'
 import { loadRegion as loadRegionFile, type RegionStats } from './region/loadRegion'
 import { buildingBoxes } from './region/collision'
 import { Painter, type BrushConfig } from './Painter'
+import { buildBuilding } from './BuildingBuilder'
+import type { BuildingSpec } from './photo/buildingSpec'
 import { DEFAULT_PALETTE, type Palette, type SurfaceKey } from './region/palette'
 import type { HeightProvider, RegionData } from './region/types'
 import {
@@ -167,6 +169,7 @@ export class Sim {
     this.setBrush = this.setBrush.bind(this)
     this.brushUndo = this.brushUndo.bind(this)
     this.brushClear = this.brushClear.bind(this)
+    this.buildBuildingFromSpec = this.buildBuildingFromSpec.bind(this)
   }
 
   async boot() {
@@ -539,6 +542,17 @@ export class Sim {
   /** How many stamps are currently on the world. */
   brushCount(): number {
     return this.painter?.count ?? 0
+  }
+
+  /**
+   * Build a 3D building from a spec + de-lit façade photos, and arm the brush
+   * with it so the user clicks to place copies. Returns its footprint so the UI
+   * can report the size the AI settled on.
+   */
+  buildBuildingFromSpec(spec: BuildingSpec, photos: (string | null)[]): { widthM: number; depthM: number; floors: number } {
+    const built = buildBuilding(this.scene, spec, photos)
+    this.painter.armTemplateNode(built.node, built.longestM)
+    return { widthM: spec.widthM, depthM: spec.depthM, floors: spec.floors }
   }
 
   /** Recolour and re-texture the region without rebuilding a single vertex. */

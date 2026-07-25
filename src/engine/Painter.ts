@@ -107,6 +107,23 @@ export class Painter {
     return { ...this.config }
   }
 
+  /**
+   * Arm the brush with an already-built node — an AI building, say — instead of
+   * a GLB to download. It becomes the template cloned on each click.
+   */
+  armTemplateNode(node: TransformNode, longestM: number) {
+    if (this.modelTemplate && this.modelTemplate !== node) this.modelTemplate.dispose()
+    node.setEnabled(false)
+    this.modelTemplate = node
+    this.modelLongest = Math.max(0.01, longestM)
+    this.modelUrl = `__node_${this.seq++}__`
+    this.modelLoading = null
+    // Place it at its real size by default — a 9 m building should land 9 m
+    // wide, not shrunk to the brush's last decal size. The user can still resize
+    // from the brush slider afterwards.
+    this.config = { ...this.config, mode: 'model', url: this.modelUrl, sizeM: this.modelLongest }
+  }
+
   // ------------------------------------------------------------------ stamping
 
   /**

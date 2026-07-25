@@ -90,6 +90,18 @@ export function loadConfig(env = process.env) {
       key: env.OPENAI_API_KEY ?? '',
       model: env.OPENAI_IMAGE_MODEL ?? 'gpt-image-1',
     },
+    // Building-from-photos analysis. Separate from the texture provider: reading
+    // a façade is a vision-LLM job, generating a texture is an image-model job.
+    // Defaults to `echo`, which returns a plausible spec with no key and no
+    // network, so the feature works out of the box and only gets smarter when a
+    // key is supplied.
+    buildingProvider: String(env.BUILDING_PROVIDER ?? 'echo').trim().toLowerCase(),
+    claude: {
+      key: env.ANTHROPIC_API_KEY ?? '',
+      baseUrl: stripSlash(env.ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com'),
+      // Any vision-capable Claude model; overridable as the ids evolve.
+      model: env.CLAUDE_VISION_MODEL ?? 'claude-3-5-sonnet-latest',
+    },
   }
 }
 
@@ -777,6 +789,29 @@ async function handle(req, res, cfg) {
     return
   }
 
+  if (req.method === 'POST' && route === '/building') {
+    try {
+      const body = await readJsonBody(req)
+      const result = await analyzeBuilding(body, cfg)
+      sendJson(res, cfg, 200, result)
+      log('building', {
+        id,
+        provider: cfg.buildingProvider,
+        source: result.source,
+        sides: Array.isArray(body?.sides) ? body.sides.length : 0,
+        ms: Date.now() - started,
+      })
+    } catch (err) {
+      // Never hard-fail: the client falls back to a local spec on any non-ok
+      // answer, so the building always appears. We just report why the AI pass
+      // was skipped.
+      const status = err?.httpStatus ?? 502
+      sendJson(res, cfg, status, { error: err?.message ?? 'analysis failed', source: 'error' })
+      log('building', { id, outcome: 'error', ms: Date.now() - started, message: String(err?.message ?? err) })
+    }
+    return
+  }
+
   if (req.method === 'POST' && route === '/pbr') {
     // Still drain the body so the socket can be reused.
     await readBody(req).catch(() => null)
@@ -821,6 +856,131 @@ async function handle(req, res, cfg) {
   }
 
   sendJson(res, cfg, 404, { error: `no route for ${req.method} ${route}` })
+}
+
+// ---------------------------------------------------- building-from-photos
+
+/** The exact JSON contract the client's sanitizeSpec() expects back. */
+const BUILDING_SCHEMA_HINT = `Return ONLY a JSON object, no prose, no code fence, of this exact shape:
+{
+  "widthM": number,        // front width in metres (3..60)
+  "depthM": number,        // side depth in metres (3..60)
+  "floors": number,        // storey count (1..40)
+  "floorHeightM": number,  // 2.4..5, usually ~3
+  "roof": "flat"|"parapet"|"pitched",
+  "roofColor": "#rrggbb",
+  "wallColor": "#rrggbb",
+  "sides": [
+    { "side":"front"|"back"|"left"|"right",
+      "cols": number,      // window columns across this wall (1..20)
+      "rows": number,      // window rows, usually = floors
+      "hasDoor": boolean,  // ground-floor entrance on this side
+      "doorCol": number,   // 0-based column of the door
+      "color": "#rrggbb" } // wall colour of this side
+  ]
+}
+Include all four sides. For sides not shown in a photo, infer a plausible façade
+matching the ones that are. Estimate real dimensions from typical storey height.`
+
+async function analyzeBuilding(body, cfg) {
+  if (cfg.buildingProvider === 'claude' && cfg.claude.key) {
+    const spec = await claudeBuilding(body, cfg)
+    return { spec, source: 'ai' }
+  }
+  // echo: a plausible spec with no vision. The client binds the photos to their
+  // sides and can fall back to its own default, so this only has to be sane.
+  return { spec: echoBuildingSpec(body), source: 'echo' }
+}
+
+function echoBuildingSpec(body) {
+  const floors = 3
+  const mk = (side) => ({
+    side,
+    cols: 3,
+    rows: floors,
+    hasDoor: side === 'front',
+    doorCol: 1,
+    color: '#d8c7a4',
+  })
+  return {
+    widthM: 9,
+    depthM: 9,
+    floors,
+    floorHeightM: 3.05,
+    roof: 'parapet',
+    roofColor: '#b0aca3',
+    wallColor: '#d8c7a4',
+    sides: ['front', 'back', 'left', 'right'].map(mk),
+    _note: 'echo provider — set BUILDING_PROVIDER=claude and ANTHROPIC_API_KEY for a real read',
+  }
+}
+
+async function claudeBuilding(body, cfg) {
+  const sides = Array.isArray(body?.sides) ? body.sides : []
+  if (sides.length === 0) throw new BadRequest('no façade photos supplied')
+
+  const content = [
+    {
+      type: 'text',
+      text:
+        `These are photos of a building's façades, each labelled with which side ` +
+        `it is. Read the architecture and describe the whole building.\n\n` +
+        BUILDING_SCHEMA_HINT,
+    },
+  ]
+  for (const s of sides) {
+    const parsed = parseDataUrl(String(s.image ?? ''))
+    if (!parsed) continue
+    content.push({ type: 'text', text: `Side: ${s.side}` })
+    content.push({
+      type: 'image',
+      source: { type: 'base64', media_type: parsed.mime, data: parsed.buf.toString('base64') },
+    })
+  }
+
+  const res = await fetch(`${cfg.claude.baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': cfg.claude.key,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: cfg.claude.model,
+      max_tokens: 1024,
+      messages: [{ role: 'user', content }],
+    }),
+    signal: AbortSignal.timeout(Math.min(cfg.timeoutMs, 90000)),
+  }).catch((err) => {
+    throw new ProviderError(`Claude request failed: ${err?.message ?? err}`)
+  })
+
+  if (!res.ok) {
+    throw new ProviderError(`Claude returned HTTP ${res.status}`, truncate(await res.text(), 400))
+  }
+  const json = await res.json()
+  const text = (json?.content ?? []).map((c) => c?.text ?? '').join('\n')
+  const spec = extractJson(text)
+  if (!spec) throw new ProviderError('Claude did not return parseable JSON', truncate(text, 400))
+  return spec
+}
+
+/** Pull the first balanced {...} object out of a possibly-chatty reply. */
+function extractJson(text) {
+  const start = text.indexOf('{')
+  if (start < 0) return null
+  let depth = 0
+  for (let i = start; i < text.length; i++) {
+    if (text[i] === '{') depth++
+    else if (text[i] === '}' && --depth === 0) {
+      try {
+        return JSON.parse(text.slice(start, i + 1))
+      } catch {
+        return null
+      }
+    }
+  }
+  return null
 }
 
 export function start(cfg = loadConfig()) {

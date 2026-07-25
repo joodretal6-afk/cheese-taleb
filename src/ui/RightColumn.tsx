@@ -3,9 +3,10 @@ import { AIPanel } from './AIPanel'
 import { PartsGrid } from './PartsGrid'
 import { PhotoStudio } from './PhotoStudio'
 import { RegionPanel } from './RegionPanel'
-import { IconAI, IconAssets, IconMountain } from './icons'
+import { BuildingStudio } from './BuildingStudio'
+import { IconAI, IconAssets, IconMountain, IconVehicle } from './icons'
 
-type Tab = 'generate' | 'photo' | 'region'
+type Tab = 'generate' | 'photo' | 'region' | 'building'
 
 /**
  * The right-hand column carries the three workflows that put surfaces into the
@@ -38,6 +39,12 @@ export function RightColumn() {
           Icon={IconMountain}
           label="المنطقة"
         />
+        <TabButton
+          active={tab === 'building'}
+          onClick={() => setTab('building')}
+          Icon={IconVehicle}
+          label="مبنى"
+        />
       </div>
 
       {tab === 'generate' && (
@@ -54,6 +61,11 @@ export function RightColumn() {
       {tab === 'region' && (
         <div className="min-h-0">
           <RegionPanel />
+        </div>
+      )}
+      {tab === 'building' && (
+        <div className="min-h-0">
+          <BuildingStudio />
         </div>
       )}
     </div>
