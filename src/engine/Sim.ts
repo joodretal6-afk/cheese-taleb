@@ -31,6 +31,7 @@ import { loadOverrides, overrideSummary, type GroundKind, type OverrideManifest 
 import { RegionScene } from './region/RegionScene'
 import { loadRegion as loadRegionFile, type RegionStats } from './region/loadRegion'
 import { buildingBoxes } from './region/collision'
+import { Painter, type BrushConfig } from './Painter'
 import { DEFAULT_PALETTE, type Palette, type SurfaceKey } from './region/palette'
 import type { HeightProvider, RegionData } from './region/types'
 import {
@@ -102,6 +103,8 @@ export class Sim {
   model!: LoadedVehicle
   mudCoat!: MudCoat
   character!: Character
+  /** Stamps decals and 3D models onto the world where the user clicks. */
+  painter!: Painter
   /** The baked neighbourhood, once one has been loaded. */
   region?: RegionScene
   /** Which car is being driven. Every physics number comes from here. */
@@ -119,6 +122,8 @@ export class Sim {
   private buildingBodies: RAPIER.RigidBody[] = []
   /** Colours currently dressing the region, so a reload keeps the user's work. */
   regionPalette: Palette = DEFAULT_PALETTE
+  /** Ground photo textures, kept so a tile-size drag does not re-decode them. */
+  private readonly groundTextures = new Map<GroundKind, { url: string; tex: Texture }>()
   /** False while the world is being torn down and rebuilt; tick() stands off. */
   private worldReady = false
 
@@ -142,6 +147,8 @@ export class Sim {
   private camReady = false
   private camSnap = false
   private lastPointer = { x: 0, y: 0 }
+  /** Where the current press began, to tell a paint tap from a camera drag. */
+  private pointerDownAt: { x: number; y: number } | null = null
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas
@@ -157,6 +164,9 @@ export class Sim {
     this.unloadRegion = this.unloadRegion.bind(this)
     this.applyRegionPalette = this.applyRegionPalette.bind(this)
     this.setVehicle = this.setVehicle.bind(this)
+    this.setBrush = this.setBrush.bind(this)
+    this.brushUndo = this.brushUndo.bind(this)
+    this.brushClear = this.brushClear.bind(this)
   }
 
   async boot() {
@@ -199,6 +209,7 @@ export class Sim {
     this.camera.maxZ = 2200
     this.camera.fov = 0.85
     this.scene.activeCamera = this.camera
+    this.painter = new Painter(this.scene)
     this.attachCameraControls()
 
     // --- vehicle model -----------------------------------------------------
@@ -336,6 +347,10 @@ export class Sim {
     this.regionBlockers = []
     this.environment?.dispose()
     this.terrain?.dispose()
+    // The ground photo textures belonged to the terrain that just went away.
+    for (const { tex } of this.groundTextures.values()) tex.dispose()
+    this.groundTextures.clear()
+    this.painter?.clear()
     this.region?.dispose()
     this.region = undefined
 
@@ -423,6 +438,15 @@ export class Sim {
     this.character.placeAt(spawn.x - 2, spawn.z, 0)
     this.character.setEnabled(this.mode === 'onfoot')
 
+    // Tell the brush what it may paint on: the ground and, in a region, the
+    // buildings. The roads are deliberately left out — a decal on a ribbon
+    // lying 12 cm above the ground would float.
+    this.painter.setTargets([
+      this.terrain.mesh,
+      this.region?.buildingMesh,
+      this.region?.mappedBuildingMesh,
+    ])
+
     // Make the chase camera jump to the new world instead of flying across it.
     this.camReady = false
     this.camSnap = true
@@ -495,6 +519,28 @@ export class Sim {
     }
   }
 
+  // -------------------------------------------------------------------- brush
+
+  /** Configure the brush. mode:'off' puts it away and clicks orbit again. */
+  setBrush(config: Partial<BrushConfig>): void {
+    this.painter.setConfig(config)
+  }
+
+  /** Remove the last thing painted; returns the count still standing. */
+  brushUndo(): number {
+    return this.painter.undo()
+  }
+
+  /** Remove everything painted. */
+  brushClear(): void {
+    this.painter.clear()
+  }
+
+  /** How many stamps are currently on the world. */
+  brushCount(): number {
+    return this.painter?.count ?? 0
+  }
+
   /** Recolour and re-texture the region without rebuilding a single vertex. */
   applyRegionPalette(palette: Palette): void {
     this.regionPalette = palette
@@ -525,9 +571,26 @@ export class Sim {
       const style = palette[key] ?? DEFAULT_PALETTE[key]
       // A user-supplied image wins over any colour: it is the real surface.
       if (style.textureUrl) {
-        const tex = new Texture(style.textureUrl, this.scene)
-        this.terrain.replaceGroundTexture(kind, tex, null, style.tileMetres)
+        // Reuse the texture across slider drags. Recreating it on every apply
+        // decodes the image again and flickers; only the URL changing warrants
+        // a new one. The tile size is a cheap number that updates in place.
+        const prev = this.groundTextures.get(kind)
+        if (prev?.url !== style.textureUrl) {
+          prev?.tex.dispose()
+          const tex = new Texture(style.textureUrl, this.scene)
+          this.groundTextures.set(kind, { url: style.textureUrl, tex })
+          this.terrain.replaceGroundTexture(kind, tex, null, style.tileMetres)
+        } else {
+          this.terrain.setGroundTileMetres(kind, style.tileMetres)
+        }
         continue
+      }
+      // Texture removed since last apply.
+      const prev = this.groundTextures.get(kind)
+      if (prev) {
+        prev.tex.dispose()
+        this.groundTextures.delete(kind)
+        this.terrain.restoreGroundTexture(kind)
       }
       // Drop-in files from public/textures/ are the user's art too — do not
       // paint over one just because the palette carries a default colour.
@@ -732,11 +795,21 @@ export class Sim {
     c.addEventListener('pointerdown', (e) => {
       this.dragging = true
       this.lastPointer = { x: e.clientX, y: e.clientY }
+      this.pointerDownAt = { x: e.clientX, y: e.clientY }
       c.setPointerCapture(e.pointerId)
     })
     c.addEventListener('pointerup', (e) => {
       this.dragging = false
       c.releasePointerCapture(e.pointerId)
+      // A tap — not a drag — while a brush is active stamps the world. Orbiting
+      // the view still works: only a click that barely moved counts as paint.
+      if (this.painter.active && this.pointerDownAt) {
+        const moved = Math.hypot(e.clientX - this.pointerDownAt.x, e.clientY - this.pointerDownAt.y)
+        if (moved < 6) {
+          void this.painter.stampAtScreen(this.scene.pointerX, this.scene.pointerY)
+        }
+      }
+      this.pointerDownAt = null
     })
     c.addEventListener('pointermove', (e) => {
       if (!this.dragging) return
@@ -1114,6 +1187,7 @@ export class Sim {
     this.region?.dispose()
     this.pipeline?.dispose()
     this.ssao?.dispose()
+    this.painter?.dispose()
     this.character?.dispose()
     this.environment?.dispose()
     this.terrain?.dispose()

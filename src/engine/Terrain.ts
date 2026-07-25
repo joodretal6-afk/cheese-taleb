@@ -53,6 +53,8 @@ export class Terrain {
   // Bound by reference into the shader; mutated each frame from the dashboard.
   private readonly mudParams = new Vector4(0, 0, 0.7, 0.85)
   private readonly envParams = new Vector4(0, 0, 0, 0)
+  // Per-kind ground tiling multiplier (x=dirt y=rock z=grass). 1 = default.
+  private readonly groundScales = new Vector4(1, 1, 1, 1)
 
   // Live values pushed in from the dashboard each frame.
   humidity = 0.7
@@ -206,6 +208,10 @@ export class Terrain {
     // x=snow y=wetGloss z=debugMode w=tileScale
     this.envParams.w = this.tileScale
     mat.AddUniform('uEnvParams', 'vec4', this.envParams)
+    // Per-kind tiling multiplier: x=dirt y=rock z=grass (w spare). 1 = the
+    // scale the shader was authored around, so the default look is untouched;
+    // the size slider drives these so each ground can be sized on its own.
+    mat.AddUniform('uGroundScales', 'vec4', this.groundScales)
 
     const shared = /* glsl */ `
       #define MUD_MAX_DEPTH ${MAX_DEPTH.toFixed(4)}
@@ -246,12 +252,17 @@ export class Terrain {
         vec2 uvMid  = wxz * 0.155 * ts;
         vec2 uvNear = wxz * 0.62 * ts;
 
-        vec3 dirt = texture2D(dirtTex, uvMid).rgb * 0.72
-                  + texture2D(dirtTex, uvFar).rgb * 0.28;
+        // Per-kind size. mud keeps the authored scale; the three palette-editable
+        // grounds each take their own multiplier so a photo can be sized to fit.
+        float sD = max(0.02, uGroundScales.x);
+        float sR = max(0.02, uGroundScales.y);
+        float sG = max(0.02, uGroundScales.z);
+        vec3 dirt = texture2D(dirtTex, uvMid * sD).rgb * 0.72
+                  + texture2D(dirtTex, uvFar * sD).rgb * 0.28;
         vec3 mud  = texture2D(mudTexA, uvMid).rgb * 0.65
                   + texture2D(mudTexA, uvNear).rgb * 0.35;
-        vec3 rock = texture2D(rockTex, uvMid * 0.6).rgb;
-        vec3 grass = texture2D(grassTex, uvMid).rgb;
+        vec3 rock = texture2D(rockTex, uvMid * 0.6 * sR).rgb;
+        vec3 grass = texture2D(grassTex, uvMid * sG).rgb;
 
         // Rock takes over on anything steep.
         float rockMix = smoothstep(0.42, 0.78, slope);
@@ -398,8 +409,56 @@ export class Terrain {
       instances[`sampler2D-${slots.normal}`] = normalHeight
     }
 
-    if (tileMetres && tileMetres > 0) this.tileScale = 1 / tileMetres
+    if (tileMetres && tileMetres > 0) this.setGroundTileMetres(kind, tileMetres)
     // Force a re-bind so the change shows without waiting for a define change.
+    this.material.markAsDirty(Material.TextureDirtyFlag)
+  }
+
+  /** Index into groundScales for the three palette-editable grounds. */
+  private static readonly SCALE_INDEX: Partial<Record<GroundKind, 'x' | 'y' | 'z'>> = {
+    dirt: 'x',
+    rock: 'y',
+    grass: 'z',
+  }
+
+  /** Authored metres-per-repeat for each ground, so tileMetres maps to reality. */
+  private static readonly BASE_TILE: Partial<Record<GroundKind, number>> = {
+    // 1/0.155 ≈ 6.45 m is the mid scale the shader samples at; each ground's
+    // "natural" size is expressed relative to that so the slider is honest.
+    dirt: 6.45,
+    rock: 10.75, // rock samples at uvMid*0.6, so its natural repeat is larger
+    grass: 6.45,
+  }
+
+  /**
+   * Set how many metres one repeat of a ground texture covers. Smaller = the
+   * image appears smaller and repeats more often, which is what "shrink it"
+   * means. mud is not adjustable — it is the churn overlay, not a surface.
+   */
+  setGroundTileMetres(kind: GroundKind, metres: number) {
+    const axis = Terrain.SCALE_INDEX[kind]
+    const base = Terrain.BASE_TILE[kind]
+    if (!axis || !base || !(metres > 0)) return
+    this.groundScales[axis] = base / metres
+  }
+
+  /** Current per-kind tiling multiplier. Inspection hook for the harness. */
+  groundScaleOf(kind: GroundKind): number {
+    const axis = Terrain.SCALE_INDEX[kind]
+    return axis ? this.groundScales[axis] : 1
+  }
+
+  /** Put a ground sampler back to its procedural texture and default size. */
+  restoreGroundTexture(kind: GroundKind) {
+    const slots = GROUND_SAMPLERS[kind]
+    const instances = (this.material as unknown as {
+      _newSamplerInstances?: Record<string, Texture>
+    })._newSamplerInstances
+    if (!instances) return
+    instances[`sampler2D-${slots.albedo}`] = this.library[kind].albedo
+    if (slots.normal) instances[`sampler2D-${slots.normal}`] = this.library[kind].normalHeight
+    const axis = Terrain.SCALE_INDEX[kind]
+    if (axis) this.groundScales[axis] = 1
     this.material.markAsDirty(Material.TextureDirtyFlag)
   }
 
