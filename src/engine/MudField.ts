@@ -67,6 +67,20 @@ export class MudField {
   private dy0 = 1
   private dy1 = 0
 
+  /**
+   * Union of everywhere that has ever been deformed. Relaxation only sweeps
+   * this, and only this is ever re-uploaded.
+   *
+   * Over a 220 m play area the difference is academic. Over a 2 km region at
+   * 2048² it is the difference between a 16 MB texture upload every frame and
+   * one the size of the patch of ground the player has actually driven on.
+   * Same convention: x0 > x1 means "nothing active".
+   */
+  private ax0 = 1
+  private ax1 = 0
+  private ay0 = 1
+  private ay1 = 0
+
   constructor(opts: MudFieldOptions) {
     this.worldSize = opts.worldSize
     this.res = opts.resolution
@@ -86,6 +100,15 @@ export class MudField {
     this.bakeBase()
     this.markAll()
     this.flushPixels()
+    // A real region starts undisturbed — no pre-worn track was baked in — so
+    // nothing is active yet and relaxation has nothing to sweep until the
+    // player drives somewhere.
+    if (this.isRealWorld) {
+      this.ax0 = 1
+      this.ax1 = 0
+      this.ay0 = 1
+      this.ay1 = 0
+    }
   }
 
   // ---------------------------------------------------------------- landscape
@@ -227,6 +250,11 @@ export class MudField {
   // --------------------------------------------------------------- deformation
 
   private markDirty(x0: number, y0: number, x1: number, y1: number) {
+    if (x0 < this.ax0 || this.ax0 > this.ax1) this.ax0 = x0
+    if (x1 > this.ax1) this.ax1 = x1
+    if (y0 < this.ay0 || this.ay0 > this.ay1) this.ay0 = y0
+    if (y1 > this.ay1) this.ay1 = y1
+
     if (this.dx0 > this.dx1) {
       this.dx0 = x0
       this.dx1 = x1
@@ -245,6 +273,16 @@ export class MudField {
     this.dy0 = 0
     this.dx1 = this.res - 1
     this.dy1 = this.res - 1
+    this.ax0 = 0
+    this.ay0 = 0
+    this.ax1 = this.res - 1
+    this.ay1 = this.res - 1
+  }
+
+  /** Re-upload everything the player has deformed, without touching the rest. */
+  private markActive() {
+    if (this.ax0 > this.ax1) return
+    this.markDirty(this.ax0, this.ay0, this.ax1, this.ay1)
   }
 
   /**
@@ -368,12 +406,18 @@ export class MudField {
     const k = 1 - Math.exp(-slump * dt)
     const treadFade = 1 - Math.exp(-(0.02 + humidity * 0.09) * dt)
 
+    // Only the ground that has actually been deformed can relax, so the sweep
+    // is bounded by the active rect rather than by the grid.
+    if (this.ax0 > this.ax1) return
+    const rx0 = this.ax0
+    const rx1 = this.ax1
+
     // Touch 1/8 of the rows per frame, cycling — 8 frames for a full sweep.
     const stride = 8
-    const start = frame % stride
+    const start = this.ay0 + (frame % stride)
     let touched = false
-    for (let y = start; y < this.res; y += stride) {
-      for (let x = 0; x < this.res; x++) {
+    for (let y = start; y <= this.ay1; y += stride) {
+      for (let x = rx0; x <= rx1; x++) {
         const i = y * this.res + x
         const d = this.depth[i]
         if (d > 0.0015) {
@@ -388,7 +432,7 @@ export class MudField {
         if (s > 0.004) this.disturb[i] = s - s * treadFade * 0.25
       }
     }
-    if (touched) this.markAll()
+    if (touched) this.markActive()
   }
 
   // ------------------------------------------------------------------- upload
