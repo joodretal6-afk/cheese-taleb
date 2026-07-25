@@ -21,6 +21,7 @@ import { Input } from './Input'
 import { Vehicle } from './Vehicle'
 import { loadVehicle, MudCoat, type LoadedVehicle } from './VehicleModel'
 import { Character, type OrientedBox } from './Character'
+import { loadOverrides, overrideSummary, type GroundKind, type OverrideManifest } from './assetOverrides'
 import {
   useSim,
   type PlayerMode,
@@ -65,6 +66,8 @@ export class Sim {
   model!: LoadedVehicle
   mudCoat!: MudCoat
   character!: Character
+  /** Which drop-in assets the user supplied, if any. */
+  overrides: OverrideManifest = { ground: {}, props: { tree: null, rock: null } }
   /** Whether the player is driving or walking. */
   mode: PlayerMode = 'driving'
   readonly input = new Input()
@@ -129,6 +132,14 @@ export class Sim {
     store.setLoadProgress(0.3)
     this.terrain = new Terrain(this.scene, this.field, quality)
     store.setLoadProgress(0.45)
+
+    // --- drop-in assets ------------------------------------------------------
+    // Probing is silent: a missing file is the normal case, not a failure.
+    this.overrides = await loadOverrides(this.scene)
+    for (const [kind, ov] of Object.entries(this.overrides.ground)) {
+      this.terrain.replaceGroundTexture(kind as GroundKind, ov.albedo, ov.normalHeight)
+    }
+    console.info('[assets]', overrideSummary(this.overrides))
 
     // --- environment -------------------------------------------------------
     this.environment = new Environment(this.scene, this.field, profile.shadowMap)
@@ -623,6 +634,21 @@ export class Sim {
       }
     }
     return meshes.length
+  }
+
+  /**
+   * Paint a texture onto the ground — a user file or a map derived from their
+   * own photo. `tileMetres` is how much ground one repeat covers, so a photo of
+   * a 2 m patch of dirt tiles at its true scale instead of an arbitrary one.
+   *
+   * Returns 1 on success, 0 if the engine isn't ready, so the UI can report it.
+   */
+  applyGroundTexture(url: string, tileMetres = 2, kind: GroundKind = 'dirt'): number {
+    if (!this.terrain) return 0
+    const tex = new Texture(url, this.scene, false, false)
+    tex.name = `photo_${kind}`
+    this.terrain.replaceGroundTexture(kind, tex, null, tileMetres)
+    return 1
   }
 
   /** Tint the selected part so the dashboard selection is visible in 3D. */

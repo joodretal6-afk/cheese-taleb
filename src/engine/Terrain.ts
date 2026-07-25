@@ -1,5 +1,6 @@
 import {
   Color3,
+  Material,
   Mesh,
   RawTexture,
   Texture,
@@ -12,6 +13,15 @@ import { PBRCustomMaterial } from '@babylonjs/materials'
 import { MAX_DEPTH, MAX_RIDGE, type MudField } from './MudField'
 import { createGroundLibrary, type GroundLibrary } from './proceduralTextures'
 import type { TerrainQuality } from '../store/simStore'
+import type { GroundKind } from './assetOverrides'
+
+/** Shader sampler names backing each ground material. */
+const GROUND_SAMPLERS: Record<GroundKind, { albedo: string; normal: string | null }> = {
+  dirt: { albedo: 'dirtTex', normal: 'dirtNH' },
+  mud: { albedo: 'mudTexA', normal: 'mudNH' },
+  rock: { albedo: 'rockTex', normal: 'rockNH' },
+  grass: { albedo: 'grassTex', normal: null },
+}
 
 /** Mesh vertices per side for each quality tier. */
 const MESH_SEGMENTS: Record<TerrainQuality, number> = {
@@ -49,6 +59,12 @@ export class Terrain {
   wetGloss = 0
   /** 0 = normal shading; 1..9 visualise a single shader channel. */
   debugMode = 0
+  /**
+   * Multiplier on the ground UV scale. 1 keeps the procedural tiling the shader
+   * was authored around; a photo-derived texture sets it from its real-world
+   * size so a 2 m wall repeats every 2 m.
+   */
+  tileScale = 1
 
   constructor(scene: Scene, field: MudField, quality: TerrainQuality) {
     this.scene = scene
@@ -185,7 +201,8 @@ export class Terrain {
     // x=worldSize y=texel z=humidity w=mudIntensity
     this.mudParams.set(worldSize, texel, this.humidity, this.mudIntensity)
     mat.AddUniform('uMudParams', 'vec4', this.mudParams)
-    // x=snow y=wetGloss z=debugMode w=unused
+    // x=snow y=wetGloss z=debugMode w=tileScale
+    this.envParams.w = this.tileScale
     mat.AddUniform('uEnvParams', 'vec4', this.envParams)
 
     const shared = /* glsl */ `
@@ -220,9 +237,12 @@ export class Terrain {
       vec3 blendGround(vec2 wxz, float slope, float wet, float disturb, float depth,
                        out float roughOut) {
         // Three tiling scales stop the eye from locking onto one repeat.
-        vec2 uvFar  = wxz * 0.035;
-        vec2 uvMid  = wxz * 0.155;
-        vec2 uvNear = wxz * 0.62;
+        // uEnvParams.w rescales all of them together when a real texture with a
+        // known physical size replaces the procedural one.
+        float ts = max(0.02, uEnvParams.w);
+        vec2 uvFar  = wxz * 0.035 * ts;
+        vec2 uvMid  = wxz * 0.155 * ts;
+        vec2 uvNear = wxz * 0.62 * ts;
 
         vec3 dirt = texture2D(dirtTex, uvMid).rgb * 0.72
                   + texture2D(dirtTex, uvFar).rgb * 0.28;
@@ -342,6 +362,45 @@ export class Terrain {
     return mat
   }
 
+  /**
+   * Swap one of the four ground materials for a real texture — a user-supplied
+   * file (assetOverrides) or a map built from their own photo (photo pipeline).
+   *
+   * PBRCustomMaterial binds custom samplers from `_newSamplerInstances`, keyed
+   * `"<kind>-<name>"`, and re-reads that map on every bind. Replacing the entry
+   * is therefore the supported way to change a bound texture after the material
+   * has been built; there is no public setter for a custom uniform.
+   *
+   * @param tileMetres how many metres one repeat of the texture covers, so a
+   *   photo of a 2 m wall tiles at its true size instead of an arbitrary one.
+   */
+  replaceGroundTexture(
+    kind: GroundKind,
+    albedo: Texture,
+    normalHeight?: Texture | null,
+    tileMetres?: number,
+  ) {
+    const slots = GROUND_SAMPLERS[kind]
+    const instances = (this.material as unknown as {
+      _newSamplerInstances?: Record<string, Texture>
+    })._newSamplerInstances
+    if (!instances) return
+
+    albedo.wrapU = Texture.WRAP_ADDRESSMODE
+    albedo.wrapV = Texture.WRAP_ADDRESSMODE
+    instances[`sampler2D-${slots.albedo}`] = albedo
+
+    if (normalHeight && slots.normal) {
+      normalHeight.wrapU = Texture.WRAP_ADDRESSMODE
+      normalHeight.wrapV = Texture.WRAP_ADDRESSMODE
+      instances[`sampler2D-${slots.normal}`] = normalHeight
+    }
+
+    if (tileMetres && tileMetres > 0) this.tileScale = 1 / tileMetres
+    // Force a re-bind so the change shows without waiting for a define change.
+    this.material.markAsDirty(Material.TextureDirtyFlag)
+  }
+
   /** Copy the live dashboard values into the uniforms bound by reference. */
   private applyParams() {
     this.mudParams.z = this.humidity
@@ -349,6 +408,7 @@ export class Terrain {
     this.envParams.x = this.snow
     this.envParams.y = this.wetGloss
     this.envParams.z = this.debugMode
+    this.envParams.w = this.tileScale
   }
 
   /** Upload only the region of the mud field that changed this frame. */

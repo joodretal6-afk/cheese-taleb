@@ -4,8 +4,7 @@ import { ViewportOverlay } from './ViewportOverlay'
 import { SimSettings } from './SimSettings'
 import { VehicleState } from './VehicleState'
 import { AssetsPanel } from './AssetsPanel'
-import { AIPanel } from './AIPanel'
-import { PartsGrid } from './PartsGrid'
+import { RightColumn } from './RightColumn'
 
 /**
  * Three-column layout from the reference: navigation, the live simulation with
@@ -36,11 +35,7 @@ export function Dashboard() {
             <AssetsPanel />
           </div>
 
-          {/* right column */}
-          <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-3">
-            <AIPanel />
-            <PartsGrid />
-          </div>
+          <RightColumn />
         </main>
       </div>
     </div>

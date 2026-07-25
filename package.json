@@ -13,16 +13,39 @@
     "shot": "node scripts/shot.mjs",
     "desktop:dev": "VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",
     "desktop:build": "npm run build && electron-builder",
-    "desktop:win": "npm run build && electron-builder --win --x64"
+    "desktop:win": "npm run build && electron-builder --win --x64",
+    "texture-service": "node server/texture-service.mjs",
+    "dev:all": "node server/texture-service.mjs & vite"
   },
   "build": {
     "appId": "com.mudterrain.simulator",
     "productName": "Mud Terrain Simulator",
-    "files": ["dist/**/*", "electron/**/*", "package.json"],
-    "directories": { "output": "release" },
-    "win": { "target": ["nsis", "portable"] },
-    "mac": { "target": ["dmg"], "category": "public.app-category.games" },
-    "linux": { "target": ["AppImage"], "category": "Game" }
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.games"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Game"
+    }
   },
   "dependencies": {
     "@babylonjs/core": "^9.18.0",
