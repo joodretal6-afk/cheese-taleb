@@ -1,4 +1,5 @@
 import { fbm, ridged } from './noise'
+import type { HeightProvider } from './region/types'
 
 /**
  * The deformable mud layer.
@@ -30,6 +31,13 @@ export interface MudFieldOptions {
   /** Texels per side. 1024 over 220 m ≈ 21 cm per texel. */
   resolution: number
   seed: number
+  /**
+   * Real-world elevation. When supplied the procedural valley is not generated
+   * at all: the landscape becomes whatever the data says, and every system built
+   * on this field — physics, deformation, the character, the camera — follows it
+   * without changing a line.
+   */
+  heightProvider?: HeightProvider
 }
 
 export class MudField {
@@ -49,6 +57,9 @@ export class MudField {
 
   /** Static landscape height, precomputed once at texel resolution. */
   private readonly base: Float32Array
+  /** Set when the landscape came from real data rather than noise. */
+  readonly isRealWorld: boolean
+  private readonly heightProvider?: HeightProvider
 
   /** Dirty rect in texel coords; x0 > x1 means "nothing dirty". */
   private dx0 = 1
@@ -61,6 +72,8 @@ export class MudField {
     this.res = opts.resolution
     this.seed = opts.seed
     this.texel = opts.worldSize / opts.resolution
+    this.heightProvider = opts.heightProvider
+    this.isRealWorld = !!opts.heightProvider
 
     const n = this.res * this.res
     this.depth = new Float32Array(n)
@@ -91,6 +104,7 @@ export class MudField {
    * either side, and a churned central track that already sits slightly lower.
    */
   private heightAt(wx: number, wz: number): number {
+    if (this.heightProvider) return this.heightProvider.heightAt(wx, wz)
     const s = this.seed
     // Large rolling shape.
     let h = (fbm(wx * 0.0065, wz * 0.0065, 5, 2.03, 0.5, s) - 0.5) * 46
@@ -125,7 +139,9 @@ export class MudField {
         this.base[y * this.res + x] = this.heightAt(wx, wz)
       }
     }
-    // Pre-soften the central track so it reads as already driven-on.
+    // Pre-soften the central track so it reads as already driven-on. Only for
+    // the procedural valley — a real region gets its wear from its own roads.
+    if (this.heightProvider) return
     const half2 = this.worldSize * 0.5
     for (let y = 0; y < this.res; y++) {
       const wz = y * this.texel - half2
