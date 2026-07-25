@@ -20,6 +20,12 @@ import { Environment } from './Environment'
 import { Input } from './Input'
 import { Vehicle } from './Vehicle'
 import { loadVehicle, MudCoat, type LoadedVehicle } from './VehicleModel'
+import {
+  DEFAULT_VEHICLE_ID,
+  getVehicle,
+  validateSpec,
+  type VehicleSpec,
+} from './vehicleCatalog'
 import { Character, type OrientedBox } from './Character'
 import { loadOverrides, overrideSummary, type GroundKind, type OverrideManifest } from './assetOverrides'
 import { RegionScene } from './region/RegionScene'
@@ -50,6 +56,10 @@ const REGION_MUD_RES = 2048
 const REGION_MAX_Z = 3200
 /** Buildings further than this cannot touch the walking player this frame. */
 const BLOCKER_RANGE = 25
+const PHYSICS_DT = 1 / 120
+const MAX_SUBSTEPS = 5
+/** How close to the driver's door you must stand to get in, metres. */
+const ENTER_RANGE = 3.2
 
 /** What landscape the world is built on. */
 type WorldSpec =
@@ -61,10 +71,6 @@ type WorldSpec =
       buildings: boolean
       onStage?: (stage: string, fraction: number) => void
     }
-const PHYSICS_DT = 1 / 120
-const MAX_SUBSTEPS = 5
-/** How close to the driver's door you must stand to get in, metres. */
-const ENTER_RANGE = 3.2
 
 interface QualityProfile {
   shadowMap: number
@@ -98,6 +104,8 @@ export class Sim {
   character!: Character
   /** The baked neighbourhood, once one has been loaded. */
   region?: RegionScene
+  /** Which car is being driven. Every physics number comes from here. */
+  vehicleSpec: VehicleSpec = getVehicle(DEFAULT_VEHICLE_ID)
   /** Which drop-in assets the user supplied, if any. */
   overrides: OverrideManifest = { ground: {}, props: { tree: null, rock: null } }
   /** Whether the player is driving or walking. */
@@ -184,10 +192,7 @@ export class Sim {
     // --- vehicle model -----------------------------------------------------
     // Loaded once for the session. Rebuilding the world swaps the landscape
     // under it, not the truck.
-    this.model = await loadVehicle(this.scene, 'models/frontier.glb', (f) =>
-      store.setLoadProgress(0.2 + f * 0.4),
-    )
-    this.mudCoat = new MudCoat(this.model)
+    await this.loadVehicleModel(this.vehicleSpec, (f) => store.setLoadProgress(0.2 + f * 0.4))
     store.setLoadProgress(0.62)
 
     // --- the world itself ---------------------------------------------------
@@ -207,6 +212,83 @@ export class Sim {
 
     this.engine.runRenderLoop(() => this.tick())
     window.addEventListener('resize', this.onResize)
+  }
+
+  // ----------------------------------------------------------------- vehicle
+
+  /**
+   * Import a car's GLB and make it the current rig. The wheel-name hints and
+   * the nominal length come from the catalogue, because every export names its
+   * parts differently and some arrive in millimetres.
+   */
+  private async loadVehicleModel(spec: VehicleSpec, onProgress?: (f: number) => void) {
+    this.model = await loadVehicle(
+      this.scene,
+      spec.modelUrl,
+      onProgress,
+      spec.wheelNameHints,
+      spec.targetLengthM,
+    )
+    this.mudCoat = new MudCoat(this.model)
+  }
+
+  /**
+   * Swap to another car in the catalogue, keeping the world exactly as it is.
+   *
+   * Falls back to the current car if the GLB is missing — only the Frontier
+   * ships with the app, so selecting one of the others without dropping its
+   * model into public/models/ must fail visibly and harmlessly rather than
+   * leave the player with no vehicle at all.
+   */
+  async setVehicle(id: string): Promise<boolean> {
+    const spec = getVehicle(id)
+    if (spec.id === this.vehicleSpec.id) return true
+
+    const problems = validateSpec(spec)
+    if (problems.length) {
+      console.warn('[vehicle]', spec.id, problems)
+      return false
+    }
+
+    const previous = this.model
+    const previousMud = this.mudCoat
+    try {
+      await this.loadVehicleModel(spec)
+    } catch (err) {
+      console.error('[vehicle] could not load', spec.modelUrl, err)
+      this.model = previous
+      this.mudCoat = previousMud
+      return false
+    }
+
+    // Put the new car where the old one was standing, facing the same way.
+    const t = this.vehicle.body.translation()
+    const r = this.vehicle.body.rotation()
+    for (const m of [...previous.bodyMeshes, ...Object.values(previous.wheels).flatMap((w) => w.meshes)]) {
+      m.dispose()
+    }
+    previous.root.dispose()
+    this.world.removeRigidBody(this.vehicle.body)
+
+    this.vehicleSpec = spec
+    this.vehicle = new Vehicle(
+      RAPIER,
+      this.world,
+      this.field,
+      this.model,
+      new Vector3(t.x, t.y, t.z),
+      spec,
+    )
+    this.vehicle.body.setRotation(r, true)
+    for (const m of [
+      ...this.model.bodyMeshes,
+      ...Object.values(this.model.wheels).flatMap((w) => w.meshes),
+    ]) {
+      this.environment.shadows.addShadowCaster(m)
+    }
+    this.warmup(2)
+    this.camSnap = true
+    return true
   }
 
   // ------------------------------------------------------------------- world
@@ -302,7 +384,7 @@ export class Sim {
     // --- the two avatars -------------------------------------------------------
     report(0.88)
     const spawn = this.region ? this.regionSpawn() : this.findSpawn()
-    this.vehicle = new Vehicle(RAPIER, this.world, this.field, this.model, spawn)
+    this.vehicle = new Vehicle(RAPIER, this.world, this.field, this.model, spawn, this.vehicleSpec)
     if (this.region) this.faceVehicle(this.region.findSpawn().yaw)
     for (const m of [
       ...this.model.bodyMeshes,
@@ -515,7 +597,7 @@ export class Sim {
       mudIntensity: s.mudIntensity,
       humidity: Math.min(1, s.humidity + this.environment.wetBias),
       ambientC: -10 + s.temperature * 55,
-      awd: true,
+      awd: this.vehicleSpec.drivetrain.awd,
     }
     const steps = Math.min(2000, Math.floor(seconds / PHYSICS_DT))
     for (let i = 0; i < steps; i++) {
@@ -762,7 +844,7 @@ export class Sim {
         mudIntensity: settings.mudIntensity,
         humidity: Math.min(1, settings.humidity + this.environment.wetBias),
         ambientC: -10 + settings.temperature * 55,
-        awd: true,
+        awd: this.vehicleSpec.drivetrain.awd,
       }
       // A parked truck still needs stepping so it settles and stays put, but it
       // must not react to the keys the player is walking around with.
