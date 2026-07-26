@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { PointerEventTypes } from '@babylonjs/core'
 import { Panel } from '../Chrome'
 import { TrafficSystem } from '../../engine/traffic/TrafficSystem'
+import { EditorCamera } from '../../engine/EditorCamera'
 
 // The engine appears on window only after boot; reach it through this narrow
 // hole. Babylon subfields stay `any` on purpose — see the other tool panels.
@@ -9,10 +10,19 @@ type SimLike = {
   scene: any
   field: any
   traffic?: TrafficSystem
+  editorCam?: EditorCamera
+}
+
+type StoreLike = {
+  getState(): { settings: { running: boolean }; set(key: 'running', value: boolean): void }
 }
 
 function getSim(): SimLike | undefined {
   return (window as unknown as { sim?: SimLike }).sim
+}
+
+function getStore(): StoreLike | undefined {
+  return (window as unknown as { __simStore?: StoreLike }).__simStore
 }
 
 /**
@@ -29,6 +39,14 @@ function getTraffic(): TrafficSystem | undefined {
   return sim.traffic
 }
 
+/** The one shared editor camera, likewise stashed on the sim. */
+function getEditorCam(): EditorCamera | undefined {
+  const sim = getSim()
+  if (!sim) return undefined
+  if (!sim.editorCam) sim.editorCam = new EditorCamera(sim.scene)
+  return sim.editorCam
+}
+
 export function TrafficPanel() {
   const [drawing, setDrawing] = useState(false)
   const [activePts, setActivePts] = useState(0)
@@ -37,10 +55,14 @@ export function TrafficPanel() {
   const [speed, setSpeed] = useState(() => getTraffic()?.getSpeed() ?? 9)
   const [running, setRunning] = useState(false)
   const [cars, setCars] = useState(0)
+  const [editorCam, setEditorCam] = useState(false)
+  const [camSpeed, setCamSpeed] = useState(() => getEditorCam()?.getSpeed() ?? 24)
 
   // Keep a live cursor into the traffic system without re-reading window each call.
   const sysRef = useRef<TrafficSystem | undefined>(undefined)
   sysRef.current = getTraffic()
+  // Remember the run state we paused when engaging the editor camera.
+  const prevRunning = useRef<boolean | null>(null)
 
   function sync() {
     const t = sysRef.current
@@ -62,6 +84,8 @@ export function TrafficPanel() {
     const scene = sim.scene
     const observer = scene.onPointerObservable.add((info: any) => {
       if (info.type !== PointerEventTypes.POINTERDOWN) return
+      // Left button only: the right button is the editor camera's look-drag.
+      if ((info.event?.button ?? 0) !== 0) return
       const p = t.pickGround(scene.pointerX, scene.pointerY)
       if (!p) return
       t.addWaypoint(p.x, p.z)
@@ -70,12 +94,62 @@ export function TrafficPanel() {
     return () => scene.onPointerObservable.remove(observer)
   }, [drawing])
 
+  // --- Editor camera ------------------------------------------------------
+  // Fly freely (right-drag to look, so left-click still draws), physics paused
+  // while it's on so WASD doesn't also drive the truck.
+  function enableEditorCam() {
+    const cam = getEditorCam()
+    if (!cam || cam.active) {
+      setEditorCam(true)
+      return
+    }
+    const store = getStore()
+    if (store) {
+      prevRunning.current = store.getState().settings.running
+      store.getState().set('running', false)
+    }
+    cam.enable({ lookButton: 2 })
+    setEditorCam(true)
+  }
+
+  function disableEditorCam() {
+    const cam = getEditorCam()
+    cam?.disable()
+    const store = getStore()
+    if (store && prevRunning.current !== null) {
+      store.getState().set('running', prevRunning.current)
+      prevRunning.current = null
+    }
+    setEditorCam(false)
+  }
+
+  function toggleEditorCam() {
+    if (getEditorCam()?.active) disableEditorCam()
+    else enableEditorCam()
+  }
+
+  function applyCamSpeed(v: number) {
+    setCamSpeed(v)
+    getEditorCam()?.setSpeed(v)
+  }
+
+  // Leaving the panel entirely shouldn't strand the camera in editor mode.
+  useEffect(() => {
+    return () => {
+      if (getEditorCam()?.active) disableEditorCam()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   function startDraw() {
     const t = sysRef.current
     if (!t) return
     t.beginLane()
     setDrawing(true)
     setActivePts(0)
+    // Drawing wants a free view — bring the editor camera up automatically so
+    // you can fly to any angle and keep left-clicking to place points.
+    if (!getEditorCam()?.active) enableEditorCam()
   }
 
   function finishDraw() {
@@ -147,6 +221,42 @@ export function TrafficPanel() {
   return (
     <Panel title="المرور" className="min-w-0" bodyClassName="min-h-0 overflow-y-auto p-4">
       <div className="flex flex-col gap-4" dir="rtl">
+        {/* Editor camera -------------------------------------------------- */}
+        <div className="flex flex-col gap-2 rounded-lg border border-ink-700 bg-ink-900/40 p-2.5">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-[12px] font-medium text-mist-300">كاميرا المحرر</span>
+            <button
+              type="button"
+              className={editorCam ? btnActive : btn}
+              onClick={toggleEditorCam}
+            >
+              {editorCam ? 'مُفعّلة' : 'تفعيل'}
+            </button>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="w-20 shrink-0 text-[12px] text-mist-400">سرعة الكاميرا</span>
+            <input
+              type="range"
+              className="h-4 min-w-0 flex-1"
+              min={4}
+              max={120}
+              step={1}
+              value={camSpeed}
+              aria-label="سرعة الكاميرا"
+              onChange={(e) => applyCamSpeed(Number(e.target.value))}
+            />
+            <span className="w-10 shrink-0 text-end text-[12px] tabular-nums text-mist-300">
+              {camSpeed}
+            </span>
+          </div>
+          <p className="text-[11px] leading-4 text-mist-400">
+            حركة: <kbd className="rounded bg-ink-700 px-1 font-mono" dir="ltr">WASD</kbd> ·
+            ارتفاع <kbd className="rounded bg-ink-700 px-1 font-mono" dir="ltr">E/Q</kbd> ·
+            نظر بسحب <span className="text-mist-300">الزر الأيمن</span> ·
+            رسم بالزر الأيسر · تسريع <kbd className="rounded bg-ink-700 px-1 font-mono" dir="ltr">Shift</kbd>.
+          </p>
+        </div>
+
         {/* Draw a path ---------------------------------------------------- */}
         <div className="flex flex-col gap-2">
           <span className="text-[12px] font-medium text-mist-300">مسارات السيارات</span>
