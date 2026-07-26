@@ -60,6 +60,7 @@
     "@babylonjs/core": "^9.18.0",
     "@babylonjs/loaders": "^9.18.0",
     "@babylonjs/materials": "^9.18.0",
+    "@babylonjs/serializers": "^9.18.0",
     "@dimforge/rapier3d-compat": "^0.19.3",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",

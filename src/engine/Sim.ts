@@ -19,19 +19,24 @@ import { Terrain } from './Terrain'
 import { Environment } from './Environment'
 import { Input } from './Input'
 import { Vehicle } from './Vehicle'
-import { loadVehicle, MudCoat, type LoadedVehicle } from './VehicleModel'
+import { loadVehicle, MudCoat, DEFAULT_WHEEL_HINTS, type LoadedVehicle } from './VehicleModel'
 import {
   DEFAULT_VEHICLE_ID,
+  estimateVehicleSpec,
   getVehicle,
   validateSpec,
+  VEHICLES,
   type VehicleSpec,
 } from './vehicleCatalog'
 import { Character, type OrientedBox } from './Character'
 import { loadOverrides, overrideSummary, type GroundKind, type OverrideManifest } from './assetOverrides'
 import { RegionScene } from './region/RegionScene'
-import { loadRegion as loadRegionFile } from './region/loadRegion'
+import { loadRegion as loadRegionFile, type RegionStats } from './region/loadRegion'
 import { buildingBoxes } from './region/collision'
-import { DEFAULT_PALETTE, type Palette } from './region/palette'
+import { Painter, type BrushConfig } from './Painter'
+import { buildBuilding } from './BuildingBuilder'
+import type { BuildingSpec } from './photo/buildingSpec'
+import { DEFAULT_PALETTE, type Palette, type SurfaceKey } from './region/palette'
 import type { HeightProvider, RegionData } from './region/types'
 import {
   useSim,
@@ -102,10 +107,15 @@ export class Sim {
   model!: LoadedVehicle
   mudCoat!: MudCoat
   character!: Character
+  /** Stamps decals and 3D models onto the world where the user clicks. */
+  painter!: Painter
   /** The baked neighbourhood, once one has been loaded. */
   region?: RegionScene
   /** Which car is being driven. Every physics number comes from here. */
   vehicleSpec: VehicleSpec = getVehicle(DEFAULT_VEHICLE_ID)
+  /** GLBs the user uploaded this session, keyed by generated id. */
+  private readonly customVehicles = new Map<string, VehicleSpec>()
+  private customSeq = 0
   /** Which drop-in assets the user supplied, if any. */
   overrides: OverrideManifest = { ground: {}, props: { tree: null, rock: null } }
   /** Whether the player is driving or walking. */
@@ -119,6 +129,8 @@ export class Sim {
   private buildingBodies: RAPIER.RigidBody[] = []
   /** Colours currently dressing the region, so a reload keeps the user's work. */
   regionPalette: Palette = DEFAULT_PALETTE
+  /** Ground photo textures, kept so a tile-size drag does not re-decode them. */
+  private readonly groundTextures = new Map<GroundKind, { url: string; tex: Texture }>()
   /** False while the world is being torn down and rebuilt; tick() stands off. */
   private worldReady = false
 
@@ -142,9 +154,29 @@ export class Sim {
   private camReady = false
   private camSnap = false
   private lastPointer = { x: 0, y: 0 }
+  /** Where the current press began, to tell a paint tap from a camera drag. */
+  private pointerDownAt: { x: number; y: number } | null = null
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas
+    /*
+     * `window.sim` is a public surface, and the natural way to feature-detect a
+     * method on it is `const f = sim.loadRegion; if (f) f(...)`. That detaches
+     * the method: `this` is undefined inside it and the first field it touches
+     * throws "Cannot read properties of undefined". The call sites are written
+     * to go through the object, but binding here means the surface cannot be
+     * misused that way at all.
+     */
+    this.loadRegion = this.loadRegion.bind(this)
+    this.unloadRegion = this.unloadRegion.bind(this)
+    this.applyRegionPalette = this.applyRegionPalette.bind(this)
+    this.setVehicle = this.setVehicle.bind(this)
+    this.addCustomVehicle = this.addCustomVehicle.bind(this)
+    this.listVehicles = this.listVehicles.bind(this)
+    this.setBrush = this.setBrush.bind(this)
+    this.brushUndo = this.brushUndo.bind(this)
+    this.brushClear = this.brushClear.bind(this)
+    this.buildBuildingFromSpec = this.buildBuildingFromSpec.bind(this)
   }
 
   async boot() {
@@ -187,6 +219,7 @@ export class Sim {
     this.camera.maxZ = 2200
     this.camera.fov = 0.85
     this.scene.activeCamera = this.camera
+    this.painter = new Painter(this.scene)
     this.attachCameraControls()
 
     // --- vehicle model -----------------------------------------------------
@@ -222,12 +255,16 @@ export class Sim {
    * parts differently and some arrive in millimetres.
    */
   private async loadVehicleModel(spec: VehicleSpec, onProgress?: (f: number) => void) {
+    // A custom vehicle's URL is an extensionless blob:; tell the loader it is a
+    // GLB so it can pick the right importer.
+    const ext = /^(blob:|data:)/.test(spec.modelUrl) ? '.glb' : undefined
     this.model = await loadVehicle(
       this.scene,
       spec.modelUrl,
       onProgress,
       spec.wheelNameHints,
       spec.targetLengthM,
+      ext,
     )
     this.mudCoat = new MudCoat(this.model)
   }
@@ -241,7 +278,7 @@ export class Sim {
    * leave the player with no vehicle at all.
    */
   async setVehicle(id: string): Promise<boolean> {
-    const spec = getVehicle(id)
+    const spec = this.resolveSpec(id)
     if (spec.id === this.vehicleSpec.id) return true
 
     const problems = validateSpec(spec)
@@ -249,11 +286,75 @@ export class Sim {
       console.warn('[vehicle]', spec.id, problems)
       return false
     }
+    return this.swapVehicle(spec)
+  }
 
+  /**
+   * Load and drive any GLB the user dropped in, with no catalogue entry and no
+   * knowledge of its wheel names.
+   *
+   * The loader finds the wheels by name, then by axle grouping, then falls back
+   * to four contact corners of the body box, so it never refuses a model. The
+   * physics spec is estimated from the model's size. Returns the new id, or null
+   * if the file could not be read as a vehicle at all.
+   */
+  async addCustomVehicle(url: string, name: string, ext = '.glb'): Promise<string | null> {
+    const id = `custom_${(name || 'vehicle').replace(/\s+/g, '_')}_${this.customSeq++}`
+    // Load once here to measure it; that same model is reused for the swap, so
+    // a big bus GLB is not downloaded twice. The extension is passed explicitly
+    // because an uploaded file arrives as an extensionless blob: URL.
+    let model: LoadedVehicle
+    try {
+      model = await loadVehicle(this.scene, url, undefined, undefined, 5, ext)
+    } catch (err) {
+      console.error('[vehicle] could not load custom model', err)
+      return null
+    }
+    const he = model.halfExtents
+    const spec = estimateVehicleSpec(id, name || 'مركبة', url, {
+      lengthM: he.z * 2,
+      widthM: he.x * 2,
+      heightM: he.y * 2,
+      wheelbaseM: model.wheelbase,
+      trackM: model.track,
+      wheelRadiusM: model.restHeight,
+    }, [...DEFAULT_WHEEL_HINTS])
+    this.customVehicles.set(id, spec)
+    const ok = await this.swapVehicle(spec, model)
+    return ok ? id : null
+  }
+
+  /** Catalogue plus every custom vehicle added this session, for the UI list. */
+  listVehicles(): { id: string; name: string; custom: boolean; virtualWheels: boolean }[] {
+    const cat = VEHICLES.map((v) => ({ id: v.id, name: v.name, custom: false, virtualWheels: false }))
+    const custom = [...this.customVehicles.values()].map((v) => ({
+      id: v.id,
+      name: v.name,
+      custom: true,
+      virtualWheels: this.vehicleSpec.id === v.id ? this.model.virtualWheels : false,
+    }))
+    return [...cat, ...custom]
+  }
+
+  /** Custom specs win over the static catalogue; unknown ids fall to default. */
+  private resolveSpec(id: string): VehicleSpec {
+    return this.customVehicles.get(id) ?? getVehicle(id)
+  }
+
+  /**
+   * The shared swap: put the new car exactly where the old one stood, facing the
+   * same way. `preloaded` reuses a model already imported by addCustomVehicle.
+   */
+  private async swapVehicle(spec: VehicleSpec, preloaded?: LoadedVehicle): Promise<boolean> {
     const previous = this.model
     const previousMud = this.mudCoat
     try {
-      await this.loadVehicleModel(spec)
+      if (preloaded) {
+        this.model = preloaded
+        this.mudCoat = new MudCoat(preloaded)
+      } else {
+        await this.loadVehicleModel(spec)
+      }
     } catch (err) {
       console.error('[vehicle] could not load', spec.modelUrl, err)
       this.model = previous
@@ -261,7 +362,6 @@ export class Sim {
       return false
     }
 
-    // Put the new car where the old one was standing, facing the same way.
     const t = this.vehicle.body.translation()
     const r = this.vehicle.body.rotation()
     for (const m of [...previous.bodyMeshes, ...Object.values(previous.wheels).flatMap((w) => w.meshes)]) {
@@ -271,14 +371,7 @@ export class Sim {
     this.world.removeRigidBody(this.vehicle.body)
 
     this.vehicleSpec = spec
-    this.vehicle = new Vehicle(
-      RAPIER,
-      this.world,
-      this.field,
-      this.model,
-      new Vector3(t.x, t.y, t.z),
-      spec,
-    )
+    this.vehicle = new Vehicle(RAPIER, this.world, this.field, this.model, new Vector3(t.x, t.y, t.z), spec)
     this.vehicle.body.setRotation(r, true)
     for (const m of [
       ...this.model.bodyMeshes,
@@ -324,6 +417,10 @@ export class Sim {
     this.regionBlockers = []
     this.environment?.dispose()
     this.terrain?.dispose()
+    // The ground photo textures belonged to the terrain that just went away.
+    for (const { tex } of this.groundTextures.values()) tex.dispose()
+    this.groundTextures.clear()
+    this.painter?.clear()
     this.region?.dispose()
     this.region = undefined
 
@@ -366,6 +463,10 @@ export class Sim {
       this.terrain.replaceGroundTexture(kind as GroundKind, ov.albedo, ov.normalHeight)
     }
 
+    // The ground half of the palette lives on Terrain, not on RegionScene, so
+    // it has to be re-applied whenever Terrain is rebuilt.
+    if (spec.kind === 'region') this.applyGroundPalette(spec.palette)
+
     // --- lighting and props ---------------------------------------------------
     report(0.76)
     this.environment = new Environment(this.scene, this.field, profile.shadowMap)
@@ -406,6 +507,15 @@ export class Sim {
     }
     this.character.placeAt(spawn.x - 2, spawn.z, 0)
     this.character.setEnabled(this.mode === 'onfoot')
+
+    // Tell the brush what it may paint on: the ground and, in a region, the
+    // buildings. The roads are deliberately left out — a decal on a ribbon
+    // lying 12 cm above the ground would float.
+    this.painter.setTargets([
+      this.terrain.mesh,
+      this.region?.buildingMesh,
+      this.region?.mappedBuildingMesh,
+    ])
 
     // Make the chase camera jump to the new world instead of flying across it.
     this.camReady = false
@@ -453,10 +563,126 @@ export class Sim {
     }
   }
 
+  /**
+   * What actually got built, for the dashboard to report.
+   *
+   * The panel can compute statistics from the file on its own, but two of them
+   * come out wrong that way. The building count in the file is the number OSM
+   * surveyed — one — while the number standing in the scene is two and a half
+   * thousand. And the steepest gradient measured on the raw satellite grid is
+   * 40%, while the road the player actually drives was graded down to 29%.
+   * Reporting the file would be describing something other than the world.
+   */
+  regionInfo(): { stats: RegionStats; buildings: number; surfaces: SurfaceKey[] } | null {
+    if (!this.region) return null
+    return {
+      stats: this.region.stats,
+      buildings: this.region.buildings.length,
+      // The ground three are always live: Terrain owns them and Terrain always
+      // exists, whatever classes of road the region happens to contain.
+      surfaces: [
+        ...this.region.activeSurfaceKeys(),
+        'ground:bare',
+        'ground:rock',
+        'ground:vegetation',
+      ],
+    }
+  }
+
+  // -------------------------------------------------------------------- brush
+
+  /** Configure the brush. mode:'off' puts it away and clicks orbit again. */
+  setBrush(config: Partial<BrushConfig>): void {
+    this.painter.setConfig(config)
+  }
+
+  /** Remove the last thing painted; returns the count still standing. */
+  brushUndo(): number {
+    return this.painter.undo()
+  }
+
+  /** Remove everything painted. */
+  brushClear(): void {
+    this.painter.clear()
+  }
+
+  /** How many stamps are currently on the world. */
+  brushCount(): number {
+    return this.painter?.count ?? 0
+  }
+
+  /**
+   * Build a 3D building from a spec + de-lit façade photos, and arm the brush
+   * with it so the user clicks to place copies. Returns its footprint so the UI
+   * can report the size the AI settled on.
+   */
+  buildBuildingFromSpec(spec: BuildingSpec, photos: (string | null)[]): { widthM: number; depthM: number; floors: number } {
+    const built = buildBuilding(this.scene, spec, photos)
+    this.painter.armTemplateNode(built.node, built.longestM)
+    return { widthM: spec.widthM, depthM: spec.depthM, floors: spec.floors }
+  }
+
   /** Recolour and re-texture the region without rebuilding a single vertex. */
   applyRegionPalette(palette: Palette): void {
     this.regionPalette = palette
     this.region?.applyPalette(palette)
+    this.applyGroundPalette(palette)
+  }
+
+  /**
+   * The three ground entries in the palette.
+   *
+   * RegionScene owns the roads and the buildings, but not the ground — that is
+   * Terrain's procedural shader, which existed long before regions did and is
+   * shared with the mud valley. So these three keys have to be applied here, or
+   * they do nothing at all, which is exactly what they did before this.
+   *
+   * A key left at its default colour is put back to the generated texture
+   * rather than tinted to an almost-identical one, so an untouched palette
+   * leaves the ground looking exactly as it was authored.
+   */
+  private applyGroundPalette(palette: Palette): void {
+    if (!this.terrain) return
+    const MAP: [SurfaceKey, GroundKind][] = [
+      ['ground:bare', 'dirt'],
+      ['ground:rock', 'rock'],
+      ['ground:vegetation', 'grass'],
+    ]
+    for (const [key, kind] of MAP) {
+      const style = palette[key] ?? DEFAULT_PALETTE[key]
+      // A user-supplied image wins over any colour: it is the real surface.
+      if (style.textureUrl) {
+        // Reuse the texture across slider drags. Recreating it on every apply
+        // decodes the image again and flickers; only the URL changing warrants
+        // a new one. The tile size is a cheap number that updates in place.
+        const prev = this.groundTextures.get(kind)
+        if (prev?.url !== style.textureUrl) {
+          prev?.tex.dispose()
+          const tex = new Texture(style.textureUrl, this.scene)
+          this.groundTextures.set(kind, { url: style.textureUrl, tex })
+          this.terrain.replaceGroundTexture(kind, tex, null, style.tileMetres)
+        } else {
+          this.terrain.setGroundTileMetres(kind, style.tileMetres)
+        }
+        continue
+      }
+      // Texture removed since last apply.
+      const prev = this.groundTextures.get(kind)
+      if (prev) {
+        prev.tex.dispose()
+        this.groundTextures.delete(kind)
+        this.terrain.restoreGroundTexture(kind)
+      }
+      // Drop-in files from public/textures/ are the user's art too — do not
+      // paint over one just because the palette carries a default colour.
+      if (this.overrides.ground[kind]) continue
+      if (style.color.toLowerCase() === DEFAULT_PALETTE[key].color.toLowerCase()) {
+        this.terrain.resetGroundTint(kind)
+        continue
+      }
+      const c = Color3.FromHexString(style.color)
+      this.terrain.tintGround(kind, c.r, c.g, c.b)
+    }
   }
 
   /** Go back to the procedural mud valley the simulator ships with. */
@@ -650,11 +876,21 @@ export class Sim {
     c.addEventListener('pointerdown', (e) => {
       this.dragging = true
       this.lastPointer = { x: e.clientX, y: e.clientY }
+      this.pointerDownAt = { x: e.clientX, y: e.clientY }
       c.setPointerCapture(e.pointerId)
     })
     c.addEventListener('pointerup', (e) => {
       this.dragging = false
       c.releasePointerCapture(e.pointerId)
+      // A tap — not a drag — while a brush is active stamps the world. Orbiting
+      // the view still works: only a click that barely moved counts as paint.
+      if (this.painter.active && this.pointerDownAt) {
+        const moved = Math.hypot(e.clientX - this.pointerDownAt.x, e.clientY - this.pointerDownAt.y)
+        if (moved < 6) {
+          void this.painter.stampAtScreen(this.scene.pointerX, this.scene.pointerY)
+        }
+      }
+      this.pointerDownAt = null
     })
     c.addEventListener('pointermove', (e) => {
       if (!this.dragging) return
@@ -1032,6 +1268,7 @@ export class Sim {
     this.region?.dispose()
     this.pipeline?.dispose()
     this.ssao?.dispose()
+    this.painter?.dispose()
     this.character?.dispose()
     this.environment?.dispose()
     this.terrain?.dispose()

@@ -47,10 +47,14 @@ export class Terrain {
 
   private readonly scene: Scene
   private readonly field: MudField
+  /** Reused tint buffers, one per ground kind — see tintGround. */
+  private readonly tinted = new Map<GroundKind, Uint8Array>()
 
   // Bound by reference into the shader; mutated each frame from the dashboard.
   private readonly mudParams = new Vector4(0, 0, 0.7, 0.85)
   private readonly envParams = new Vector4(0, 0, 0, 0)
+  // Per-kind ground tiling multiplier (x=dirt y=rock z=grass). 1 = default.
+  private readonly groundScales = new Vector4(1, 1, 1, 1)
 
   // Live values pushed in from the dashboard each frame.
   humidity = 0.7
@@ -204,6 +208,10 @@ export class Terrain {
     // x=snow y=wetGloss z=debugMode w=tileScale
     this.envParams.w = this.tileScale
     mat.AddUniform('uEnvParams', 'vec4', this.envParams)
+    // Per-kind tiling multiplier: x=dirt y=rock z=grass (w spare). 1 = the
+    // scale the shader was authored around, so the default look is untouched;
+    // the size slider drives these so each ground can be sized on its own.
+    mat.AddUniform('uGroundScales', 'vec4', this.groundScales)
 
     const shared = /* glsl */ `
       #define MUD_MAX_DEPTH ${MAX_DEPTH.toFixed(4)}
@@ -244,12 +252,17 @@ export class Terrain {
         vec2 uvMid  = wxz * 0.155 * ts;
         vec2 uvNear = wxz * 0.62 * ts;
 
-        vec3 dirt = texture2D(dirtTex, uvMid).rgb * 0.72
-                  + texture2D(dirtTex, uvFar).rgb * 0.28;
+        // Per-kind size. mud keeps the authored scale; the three palette-editable
+        // grounds each take their own multiplier so a photo can be sized to fit.
+        float sD = max(0.02, uGroundScales.x);
+        float sR = max(0.02, uGroundScales.y);
+        float sG = max(0.02, uGroundScales.z);
+        vec3 dirt = texture2D(dirtTex, uvMid * sD).rgb * 0.72
+                  + texture2D(dirtTex, uvFar * sD).rgb * 0.28;
         vec3 mud  = texture2D(mudTexA, uvMid).rgb * 0.65
                   + texture2D(mudTexA, uvNear).rgb * 0.35;
-        vec3 rock = texture2D(rockTex, uvMid * 0.6).rgb;
-        vec3 grass = texture2D(grassTex, uvMid).rgb;
+        vec3 rock = texture2D(rockTex, uvMid * 0.6 * sR).rgb;
+        vec3 grass = texture2D(grassTex, uvMid * sG).rgb;
 
         // Rock takes over on anything steep.
         float rockMix = smoothstep(0.42, 0.78, slope);
@@ -396,9 +409,115 @@ export class Terrain {
       instances[`sampler2D-${slots.normal}`] = normalHeight
     }
 
-    if (tileMetres && tileMetres > 0) this.tileScale = 1 / tileMetres
+    if (tileMetres && tileMetres > 0) this.setGroundTileMetres(kind, tileMetres)
     // Force a re-bind so the change shows without waiting for a define change.
     this.material.markAsDirty(Material.TextureDirtyFlag)
+  }
+
+  /** Index into groundScales for the three palette-editable grounds. */
+  private static readonly SCALE_INDEX: Partial<Record<GroundKind, 'x' | 'y' | 'z'>> = {
+    dirt: 'x',
+    rock: 'y',
+    grass: 'z',
+  }
+
+  /** Authored metres-per-repeat for each ground, so tileMetres maps to reality. */
+  private static readonly BASE_TILE: Partial<Record<GroundKind, number>> = {
+    // 1/0.155 ≈ 6.45 m is the mid scale the shader samples at; each ground's
+    // "natural" size is expressed relative to that so the slider is honest.
+    dirt: 6.45,
+    rock: 10.75, // rock samples at uvMid*0.6, so its natural repeat is larger
+    grass: 6.45,
+  }
+
+  /**
+   * Set how many metres one repeat of a ground texture covers. Smaller = the
+   * image appears smaller and repeats more often, which is what "shrink it"
+   * means. mud is not adjustable — it is the churn overlay, not a surface.
+   */
+  setGroundTileMetres(kind: GroundKind, metres: number) {
+    const axis = Terrain.SCALE_INDEX[kind]
+    const base = Terrain.BASE_TILE[kind]
+    if (!axis || !base || !(metres > 0)) return
+    this.groundScales[axis] = base / metres
+  }
+
+  /** Current per-kind tiling multiplier. Inspection hook for the harness. */
+  groundScaleOf(kind: GroundKind): number {
+    const axis = Terrain.SCALE_INDEX[kind]
+    return axis ? this.groundScales[axis] : 1
+  }
+
+  /** Put a ground sampler back to its procedural texture and default size. */
+  restoreGroundTexture(kind: GroundKind) {
+    const slots = GROUND_SAMPLERS[kind]
+    const instances = (this.material as unknown as {
+      _newSamplerInstances?: Record<string, Texture>
+    })._newSamplerInstances
+    if (!instances) return
+    instances[`sampler2D-${slots.albedo}`] = this.library[kind].albedo
+    if (slots.normal) instances[`sampler2D-${slots.normal}`] = this.library[kind].normalHeight
+    const axis = Terrain.SCALE_INDEX[kind]
+    if (axis) this.groundScales[axis] = 1
+    this.material.markAsDirty(Material.TextureDirtyFlag)
+  }
+
+  /**
+   * Recolour one of the four ground materials, keeping its grain.
+   *
+   * A flat colour would erase the procedural detail that makes the ground read
+   * as soil rather than as a painted plane, so each texel is rescaled about the
+   * texture's own mean instead: the result averages to exactly the colour asked
+   * for, while every bump, speck and streak survives at the same relative
+   * strength. Same trick the region uses to keep per-house colour variety under
+   * a changed building colour.
+   *
+   * Cheap enough to call on every slider drag — one 512² pass, no reallocation
+   * after the first call for a given kind.
+   */
+  tintGround(kind: GroundKind, r: number, g: number, b: number) {
+    const set = this.library[kind]
+    const src = set.albedoData
+    const n = set.size * set.size
+
+    let mr = 0
+    let mg = 0
+    let mb = 0
+    for (let i = 0; i < n; i++) {
+      mr += src[i * 4]
+      mg += src[i * 4 + 1]
+      mb += src[i * 4 + 2]
+    }
+    // Guard a black source: dividing by its mean would be a division by zero.
+    mr = Math.max(1, mr / n)
+    mg = Math.max(1, mg / n)
+    mb = Math.max(1, mb / n)
+
+    let out = this.tinted.get(kind)
+    if (!out) {
+      out = new Uint8Array(src.length)
+      this.tinted.set(kind, out)
+    }
+    const kr = (r * 255) / mr
+    const kg = (g * 255) / mg
+    const kb = (b * 255) / mb
+    for (let i = 0; i < n; i++) {
+      const o = i * 4
+      const vr = src[o] * kr
+      const vg = src[o + 1] * kg
+      const vb = src[o + 2] * kb
+      out[o] = vr > 255 ? 255 : vr
+      out[o + 1] = vg > 255 ? 255 : vg
+      out[o + 2] = vb > 255 ? 255 : vb
+      out[o + 3] = src[o + 3]
+    }
+    set.albedo.update(out)
+  }
+
+  /** Put a ground material back to the colour it was generated with. */
+  resetGroundTint(kind: GroundKind) {
+    const set = this.library[kind]
+    set.albedo.update(set.albedoData)
   }
 
   /** Copy the live dashboard values into the uniforms bound by reference. */

@@ -33,7 +33,21 @@ type SimWindow = Window & {
     loadRegion?(source: RegionData, palette: Palette, options?: RegionLoadOptions): Promise<void>
     applyRegionPalette?(palette: Palette): void
     unloadRegion?(): Promise<void>
+    regionInfo?(): { stats: RegionStats; buildings: number; surfaces: SurfaceKey[] } | null
+    setBrush?(config: {
+      mode?: 'off' | 'decal' | 'model'
+      url?: string | null
+      sizeM?: number
+      rotationDeg?: number
+    }): void
+    brushUndo?(): number
+    brushClear?(): void
+    brushCount?(): number
   }
+}
+
+function simApi() {
+  return (window as SimWindow).sim
 }
 
 /** Human names for the baked regions; the file only carries the slug. */
@@ -69,6 +83,10 @@ export function RegionPanel() {
     () => (region.paletteJson && parsePalette(region.paletteJson)) || clonePalette(DEFAULT_PALETTE),
   )
   const [stats, setStats] = useState<RegionStats | null>(null)
+  /** Buildings actually standing in the scene, which is not what the file says. */
+  const [placed, setPlaced] = useState<number | null>(null)
+  /** Keys this region has something to dress. Null until a region is loaded. */
+  const [active, setActive] = useState<SurfaceKey[] | null>(null)
   const attribution = region.attribution
   const [stage, setStage] = useState<{ label: string; fraction: number } | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -134,12 +152,15 @@ export function RegionPanel() {
       setStats(describeRegion(data))
 
       if (!engineReady) throw new Error('المحرك لم يجهز بعد — انتظر اكتمال تحميل المشهد ثم أعد المحاولة')
-      const build = (window as SimWindow).sim?.loadRegion
-      if (!build) throw new Error('بناء المناطق غير متاح في هذه النسخة من المحرك')
+      // Feature-detect on the object, then call THROUGH it. Pulling the method
+      // out into a variable and calling that detaches it from the Sim instance,
+      // so `this` is undefined inside and the first field it touches throws.
+      const sim = (window as SimWindow).sim
+      if (!sim?.loadRegion) throw new Error('بناء المناطق غير متاح في هذه النسخة من المحرك')
 
       setStage({ label: 'بناء التضاريس والطرق والمباني', fraction: 0.3 })
       let reported = false
-      await build(data, palette, {
+      await sim.loadRegion(data, palette, {
         buildings,
         // The engine names each stage as it reaches it. Only if it says nothing
         // at all does the bar fall back to easing.
@@ -152,6 +173,16 @@ export function RegionPanel() {
         },
       })
       if (!reported) startCreep()
+      // Replace the figures read from the file with what the engine actually
+      // built. Two of them differ: the file knows one surveyed building where
+      // thousands now stand, and its steepest gradient is measured on the raw
+      // satellite grid rather than on the graded road the player drives.
+      const info = sim.regionInfo?.()
+      if (info) {
+        setStats(info.stats)
+        setPlaced(info.buildings)
+        setActive(info.surfaces)
+      }
       patchRegion({ name, loaded: true, buildings, paletteJson: serialisePalette(palette) })
       setNote('تم بناء المنطقة داخل المشهد')
     } catch (err) {
@@ -165,8 +196,9 @@ export function RegionPanel() {
   /** Back to the procedural mud valley the simulator ships with. */
   async function unload() {
     if (stage || !region.loaded) return
-    const drop = (window as SimWindow).sim?.unloadRegion
-    if (!drop) {
+    // Called through `sim`, never as a detached reference — see load().
+    const sim = (window as SimWindow).sim
+    if (!sim?.unloadRegion) {
       setError('العودة إلى الوادي غير متاحة في هذه النسخة من المحرك')
       return
     }
@@ -175,9 +207,11 @@ export function RegionPanel() {
     setStage({ label: 'العودة إلى الوادي الافتراضي', fraction: 0.4 })
     startCreep()
     try {
-      await drop()
+      await sim.unloadRegion()
       patchRegion({ loaded: false, attribution: null })
       setStats(null)
+      setPlaced(null)
+      setActive(null)
       setNote('تمت العودة إلى الوادي الافتراضي')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'فشلت العودة إلى الوادي')
@@ -328,7 +362,11 @@ export function RegionPanel() {
             <Stat label="أطوال الطرق" value={stats.roadKm.toFixed(1)} unit="كم" />
             <Stat label="فارق الارتفاع" value={String(Math.round(stats.reliefM))} unit="م" />
             <Stat label="أشد انحدار" value={stats.steepestRoadGrade.toFixed(1)} unit="٪" />
-            <Stat label="المباني" value={String(stats.buildingCount)} unit="مبنى" />
+            <Stat
+              label="المباني"
+              value={String(placed ?? stats.buildingCount)}
+              unit={placed && placed > stats.buildingCount ? `مبنى · ${stats.buildingCount} مرسوم` : 'مبنى'}
+            />
           </div>
 
           <details className="mt-2 rounded-lg border border-ink-700 bg-ink-900/60 px-3 py-2">
@@ -346,11 +384,13 @@ export function RegionPanel() {
           <SurfaceRow
             key={key}
             style={palette[key]}
+            inactive={active !== null && !active.includes(key)}
             open={picking === key}
             library={library}
             onTogglePicker={() => setPicking(picking === key ? null : key)}
             onColor={(color) => setStyle(key, { color })}
             onRoughness={(roughness) => setStyle(key, { roughness })}
+            onTile={(tileMetres) => setStyle(key, { tileMetres })}
             onTexture={(textureUrl) => {
               setStyle(key, { textureUrl })
               setPicking(null)
@@ -359,6 +399,8 @@ export function RegionPanel() {
           />
         ))}
       </div>
+
+      <BrushSection library={library} />
 
       <h3 className="mt-4 mb-2 text-[12px] font-medium text-mist-300">حفظ ومشاركة الألوان</h3>
       <textarea
@@ -393,6 +435,230 @@ export function RegionPanel() {
         {attribution ?? FALLBACK_ATTRIBUTION}
       </p>
     </Panel>
+  )
+}
+
+type BrushMode = 'off' | 'decal' | 'model'
+
+/**
+ * The brush. Choose an image (a door, a window, grass) or a 3D model, set its
+ * size, then click on the scene to stamp it — on the ground or on a wall.
+ *
+ * The engine owns the placing; this only configures it and reports the count.
+ * A brush left on would keep painting on every click, so switching away from
+ * this section is the user's job — the big "توقّف" makes that one tap.
+ */
+function BrushSection({ library }: { library: { id: string; url: string }[] }) {
+  const [mode, setMode] = useState<BrushMode>('off')
+  const [url, setUrl] = useState<string | null>(null)
+  const [sizeM, setSizeM] = useState(2)
+  const [rotationDeg, setRotationDeg] = useState(0)
+  const [count, setCount] = useState(0)
+
+  function push(next: { mode?: BrushMode; url?: string | null; sizeM?: number; rotationDeg?: number }) {
+    simApi()?.setBrush?.(next)
+  }
+
+  function choose(m: BrushMode) {
+    setMode(m)
+    // Switching to a mode with no asset yet keeps the brush off until one is
+    // picked, so an accidental click paints nothing.
+    push({ mode: m === 'off' ? 'off' : url ? m : 'off', url, sizeM, rotationDeg })
+  }
+
+  function pickImage(u: string | null) {
+    setUrl(u)
+    push({ mode: u ? mode : 'off', url: u, sizeM, rotationDeg })
+  }
+
+  function onFile(file: File | undefined, expect: 'image' | 'model') {
+    if (!file) return
+    // A model is a binary GLB — an object URL avoids base64-inflating megabytes.
+    if (expect === 'model') {
+      pickImage(URL.createObjectURL(file))
+      return
+    }
+    const reader = new FileReader()
+    reader.onload = () => typeof reader.result === 'string' && pickImage(reader.result)
+    reader.readAsDataURL(file)
+  }
+
+  const armed = mode !== 'off' && !!url
+
+  return (
+    <>
+      <h3 className="mt-4 mb-2 flex items-center gap-2 text-[12px] font-medium text-mist-300">
+        الفرشاة — ارسم على الأرض والمباني
+        {armed && <span className="rounded bg-brand-500/20 px-1.5 py-0.5 text-[10px] text-brand-300">مفعّلة</span>}
+      </h3>
+
+      <div className="flex gap-1 rounded-lg border border-ink-700 bg-ink-850 p-1">
+        {(['off', 'decal', 'model'] as BrushMode[]).map((m) => (
+          <button
+            key={m}
+            type="button"
+            onClick={() => choose(m)}
+            className={`flex-1 rounded-md px-2 py-1.5 text-[11px] transition-colors ${
+              mode === m ? 'bg-brand-500/15 font-medium text-brand-400' : 'text-mist-400 hover:bg-ink-800'
+            }`}
+          >
+            {m === 'off' ? 'توقّف' : m === 'decal' ? 'صورة' : 'مجسّم 3D'}
+          </button>
+        ))}
+      </div>
+
+      {mode !== 'off' && (
+        <div className="mt-2 space-y-2 rounded-lg border border-ink-700 bg-ink-900/60 p-2">
+          {mode === 'decal' ? (
+            <>
+              {library.length > 0 && (
+                <div className="grid grid-cols-6 gap-1.5">
+                  {library.map((t) => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => pickImage(t.url)}
+                      className={`relative aspect-square overflow-hidden rounded-md border transition-colors ${
+                        t.url === url ? 'border-brand-500' : 'border-ink-600 hover:border-ink-500'
+                      }`}
+                    >
+                      <img src={t.url} alt="" className="h-full w-full object-cover" />
+                    </button>
+                  ))}
+                </div>
+              )}
+              <label className="block cursor-pointer rounded-md bg-ink-700 px-2 py-1.5 text-center text-[11px] text-mist-200 transition-colors hover:bg-ink-600">
+                اختيار صورة (باب، شباك، أعشاب…)
+                <input type="file" accept="image/*" className="hidden" onChange={(e) => onFile(e.target.files?.[0], 'image')} />
+              </label>
+              {url && <img src={url} alt="" className="h-12 w-full rounded object-contain" />}
+            </>
+          ) : (
+            <>
+              <label className="block cursor-pointer rounded-md bg-ink-700 px-2 py-1.5 text-center text-[11px] text-mist-200 transition-colors hover:bg-ink-600">
+                اختيار ملف مجسّم (.glb)
+                <input type="file" accept=".glb,model/gltf-binary" className="hidden" onChange={(e) => onFile(e.target.files?.[0], 'model')} />
+              </label>
+              {url && <p className="truncate text-[10px] text-mist-400" dir="ltr">{url.slice(0, 48)}</p>}
+            </>
+          )}
+
+          <BrushSlider
+            label="الحجم"
+            value={sizeM}
+            min={0.2}
+            max={mode === 'model' ? 30 : 12}
+            log
+            display={sizeM < 1 ? `${Math.round(sizeM * 100)}سم` : `${sizeM.toFixed(1)}م`}
+            onChange={(v) => {
+              setSizeM(v)
+              push({ mode: armed ? mode : 'off', url, sizeM: v, rotationDeg })
+            }}
+          />
+          <BrushSlider
+            label="دوران"
+            value={rotationDeg}
+            min={0}
+            max={360}
+            display={`${Math.round(rotationDeg)}°`}
+            onChange={(v) => {
+              setRotationDeg(v)
+              push({ mode: armed ? mode : 'off', url, sizeM, rotationDeg: v })
+            }}
+          />
+
+          <p className="text-[10px] leading-4 text-mist-400">
+            {armed
+              ? 'انقر على الأرض أو على جدار مبنى لوضع النسخة. اسحب لتدوير الكاميرا.'
+              : 'اختر صورة أو مجسّماً أولاً.'}
+          </p>
+
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setCount(simApi()?.brushUndo?.() ?? 0)}
+              disabled={count === 0}
+              className="flex-1 rounded-md bg-ink-700 px-2 py-1.5 text-[11px] text-mist-200 transition-colors hover:bg-ink-600 disabled:opacity-40"
+            >
+              تراجع
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                simApi()?.brushClear?.()
+                setCount(0)
+              }}
+              disabled={count === 0}
+              className="flex-1 rounded-md bg-ink-700 px-2 py-1.5 text-[11px] text-mist-200 transition-colors hover:bg-ink-600 disabled:opacity-40"
+            >
+              مسح الكل ({count})
+            </button>
+          </div>
+
+          {/* The engine reports the true count after each stamp; a click may miss
+              (the sky) and place nothing, so poll on a short timer while armed. */}
+          {armed && <CountPoller onCount={setCount} />}
+        </div>
+      )}
+    </>
+  )
+}
+
+/**
+ * A stamp happens on a canvas click, which React never sees, and a click can
+ * miss and place nothing. So the true count lives in the engine and this reads
+ * it back a couple of times a second while the brush is armed.
+ */
+function CountPoller({ onCount }: { onCount: (n: number) => void }) {
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const c = simApi()?.brushCount?.()
+      if (typeof c === 'number') onCount(c)
+    }, 500)
+    return () => window.clearInterval(id)
+  }, [onCount])
+  return null
+}
+
+function BrushSlider({
+  label,
+  value,
+  min,
+  max,
+  display,
+  log = false,
+  onChange,
+}: {
+  label: string
+  value: number
+  min: number
+  max: number
+  display: string
+  log?: boolean
+  onChange: (v: number) => void
+}) {
+  const toSlider = (v: number) => (log ? Math.log(v) : v)
+  const lo = toSlider(min)
+  const hi = toSlider(max)
+  const pos = value <= min ? 0 : value >= max ? 1 : (toSlider(value) - lo) / (hi - lo)
+  return (
+    <div className="flex items-center gap-2">
+      <span className="w-10 shrink-0 text-[11px] text-mist-400">{label}</span>
+      <input
+        type="range"
+        min={lo}
+        max={hi}
+        step={(hi - lo) / 200}
+        value={toSlider(value)}
+        aria-label={label}
+        onChange={(e) => onChange(log ? Math.exp(Number(e.target.value)) : Number(e.target.value))}
+        className="h-4 min-w-0 flex-1"
+        style={{
+          ['--track' as string]: `linear-gradient(to right, var(--color-brand-500) ${pos * 100}%, var(--color-ink-600) ${pos * 100}%)`,
+        }}
+      />
+      <span className="w-10 shrink-0 text-end text-[11px] tabular-nums text-mist-300">{display}</span>
+    </div>
   )
 }
 
@@ -448,26 +714,34 @@ function Toggle({
 
 function SurfaceRow({
   style,
+  inactive,
   open,
   library,
   onTogglePicker,
   onColor,
   onRoughness,
+  onTile,
   onTexture,
   onFile,
 }: {
   style: SurfaceStyle
+  /** This region contains nothing of this surface, so editing it does nothing. */
+  inactive: boolean
   open: boolean
   library: { id: string; url: string }[]
   onTogglePicker: () => void
   onColor: (v: string) => void
   onRoughness: (v: number) => void
+  onTile: (metres: number) => void
   onTexture: (url: string | null) => void
   onFile: (file: File | undefined) => void
 }) {
   const pct = style.roughness * 100
   return (
-    <div className="rounded-lg border border-ink-700 bg-ink-900/60 p-2">
+    <div
+      className={`rounded-lg border border-ink-700 bg-ink-900/60 p-2 ${inactive ? 'opacity-45' : ''}`}
+      title={inactive ? 'لا يوجد من هذا السطح شيء في هذه المنطقة' : undefined}
+    >
       <div className="flex items-center gap-2">
         <input
           type="color"
@@ -476,7 +750,10 @@ function SurfaceRow({
           onChange={(e) => onColor(e.target.value)}
           className="h-7 w-7 shrink-0 cursor-pointer rounded-md border border-ink-600 bg-ink-800 p-0.5"
         />
-        <span className="min-w-0 flex-1 truncate text-[12px] text-mist-300">{style.label}</span>
+        <span className="min-w-0 flex-1 truncate text-[12px] text-mist-300">
+          {style.label}
+          {inactive && <span className="ms-1.5 text-[10px] text-mist-500">لا يوجد هنا</span>}
+        </span>
         <button
           type="button"
           onClick={onTogglePicker}
@@ -512,6 +789,34 @@ function SurfaceRow({
           {style.roughness.toFixed(2)}
         </span>
       </div>
+
+      {style.textureUrl && (
+        <div className="mt-1.5 flex items-center gap-2">
+          <span className="w-10 shrink-0 text-[11px] text-mist-400">الحجم</span>
+          <input
+            type="range"
+            // Metres per repeat. Log scale: one repeat every 20 cm (tiny) up to
+            // every 30 m (huge). Small = the image is smaller on the ground.
+            min={Math.log(0.2)}
+            max={Math.log(30)}
+            step={0.01}
+            value={Math.log(style.tileMetres)}
+            aria-label={`حجم نسيج ${style.label}`}
+            onChange={(e) => onTile(Math.exp(Number(e.target.value)))}
+            className="h-4 min-w-0 flex-1"
+            style={{
+              ['--track' as string]: `linear-gradient(to right, var(--color-brand-500) ${
+                ((Math.log(style.tileMetres) - Math.log(0.2)) / (Math.log(30) - Math.log(0.2))) * 100
+              }%, var(--color-ink-600) ${
+                ((Math.log(style.tileMetres) - Math.log(0.2)) / (Math.log(30) - Math.log(0.2))) * 100
+              }%)`,
+            }}
+          />
+          <span className="w-10 shrink-0 text-end text-[11px] tabular-nums text-mist-300">
+            {style.tileMetres < 1 ? `${Math.round(style.tileMetres * 100)}سم` : `${style.tileMetres.toFixed(1)}م`}
+          </span>
+        </div>
+      )}
 
       {open && (
         <div className="mt-2 border-t border-ink-700 pt-2">

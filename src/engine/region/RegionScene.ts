@@ -246,6 +246,18 @@ export class RegionScene {
    * dozen property writes and the next frame shows it — no re-triangulation, no
    * buffer upload, no reload.
    */
+  /**
+   * Surface keys this region actually has something to dress.
+   *
+   * A material is only created for a road class that occurs here, so in
+   * Khalidiya — which has no footway, path, pedestrian or steps — 'road:path'
+   * dresses nothing. The panel uses this to say so, rather than offering a
+   * colour picker that silently does nothing.
+   */
+  activeSurfaceKeys(): SurfaceKey[] {
+    return this.surfaces.map((s) => s.key)
+  }
+
   applyPalette(palette: Palette): void {
     for (const surface of this.surfaces) {
       this.applyStyle(surface, palette[surface.key] ?? DEFAULT_PALETTE[surface.key])

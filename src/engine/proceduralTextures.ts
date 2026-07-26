@@ -12,6 +12,15 @@ export interface GroundMapSet {
   albedo: RawTexture
   /** RGB = tangent-space normal, A = height (used for detail shading). */
   normalHeight: RawTexture
+  /**
+   * The albedo bytes that were uploaded, kept so the ground can be re-tinted.
+   *
+   * A GPU texture cannot be read back cheaply, and the region palette needs to
+   * recolour the ground while keeping its grain — which means multiplying these
+   * pixels, not replacing them with a flat colour.
+   */
+  albedoData: Uint8Array
+  size: number
 }
 
 type Rgb = [number, number, number]
@@ -167,7 +176,7 @@ function makeGroundMaps(scene: Scene, name: string, spec: GroundSpec, size = 512
   normalHeight.wrapU = Texture.WRAP_ADDRESSMODE
   normalHeight.wrapV = Texture.WRAP_ADDRESSMODE
 
-  return { albedo, normalHeight }
+  return { albedo, normalHeight, albedoData, size }
 }
 
 export interface GroundLibrary {
