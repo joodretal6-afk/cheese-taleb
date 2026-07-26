@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { PointerEventTypes } from '@babylonjs/core'
 import { Panel } from '../Chrome'
-import { TrafficSystem } from '../../engine/traffic/TrafficSystem'
+import { TrafficSystem, BUILTIN_CARS } from '../../engine/traffic/TrafficSystem'
 import { EditorCamera } from '../../engine/EditorCamera'
 
 // The engine appears on window only after boot; reach it through this narrow
@@ -61,6 +61,7 @@ export function TrafficPanel() {
     { id: string; name: string; count: number; flip: boolean; wheels: number }[]
   >([])
   const [uploading, setUploading] = useState(false)
+  const [loadingDefaults, setLoadingDefaults] = useState(false)
 
   // Keep a live cursor into the traffic system without re-reading window each call.
   const sysRef = useRef<TrafficSystem | undefined>(undefined)
@@ -243,6 +244,36 @@ export function TrafficPanel() {
     refreshModels()
   }
 
+  async function addBuiltin(b: (typeof BUILTIN_CARS)[number]) {
+    const t = sysRef.current
+    if (!t) return
+    setUploading(true)
+    try {
+      const id = await t.addModel(b.url, b.name, '.glb')
+      if (id) refreshModels()
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  // On first open, bring in the ready-made cars in place of the box cars.
+  useEffect(() => {
+    const t = sysRef.current
+    if (!t) return
+    let cancelled = false
+    setLoadingDefaults(true)
+    void t.loadDefaults().then(() => {
+      if (cancelled) return
+      setCount(t.getCount())
+      refreshModels()
+      setLoadingDefaults(false)
+    })
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   function togglePlay() {
     const t = sysRef.current
     if (!t) return
@@ -390,9 +421,30 @@ export function TrafficPanel() {
               />
             </label>
           </div>
+          {/* Ready-made cars that ship with the app. */}
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[11px] text-mist-400">
+              {loadingDefaults ? 'يجري تحميل السيارات الجاهزة…' : 'سيارات جاهزة (اضغط للإضافة):'}
+            </span>
+            <div className="flex flex-wrap gap-1.5">
+              {BUILTIN_CARS.map((b) => (
+                <button
+                  key={b.key}
+                  type="button"
+                  disabled={uploading || loadingDefaults}
+                  onClick={() => void addBuiltin(b)}
+                  title={b.note ?? (b.wheels ? 'عجالها تلف' : 'عجالها لا تلف (غير مسمّاة)')}
+                  className="rounded-md border border-ink-600 bg-ink-800 px-2 py-1 text-[11px] text-mist-200 transition-colors hover:bg-ink-700 disabled:opacity-40"
+                >
+                  + {b.name}
+                </button>
+              ))}
+            </div>
+          </div>
+
           {models.length === 0 ? (
             <p className="text-[11px] leading-4 text-mist-400">
-              ارفع ملف GLB لسيارة ليصير طرازاً — وحدد كم سيارة من كل طراز تولّدها.
+              السيارات الجاهزة أعلاه، أو ارفع ملف GLB خاص بك. حدّد كم سيارة من كل طراز.
             </p>
           ) : (
             <div className="flex flex-col gap-2">

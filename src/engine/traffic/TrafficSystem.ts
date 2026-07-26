@@ -116,6 +116,19 @@ interface CarType {
   ext: string
 }
 
+/**
+ * Ready-made cars that ship with the app, offered in the panel and (the two
+ * clean ones) loaded by default in place of the generated boxes. `wheels` marks
+ * whether the model names its wheels so they visibly spin.
+ */
+export const BUILTIN_CARS: { key: string; name: string; url: string; wheels: boolean; def: boolean; note?: string }[] = [
+  { key: 'police', name: 'شرطة (Crown Vic)', url: 'models/police_car.glb', wheels: true, def: true },
+  { key: 'mercedes', name: 'مرسيدس W201', url: 'models/mercedes_w201.glb', wheels: false, def: true },
+  { key: 'alfa', name: 'ألفا روميو 1967', url: 'models/alfa_romeo_1967.glb', wheels: false, def: false, note: 'منخفضة الارتفاع' },
+  { key: 'audi', name: 'أودي TT 2003', url: 'models/audi_tt.glb', wheels: false, def: false },
+  { key: 'pack', name: 'باقة سيارات (عدة سيارات بملف)', url: 'models/car_pack_1.glb', wheels: true, def: false, note: 'ملف فيه عدة سيارات' },
+]
+
 /** Uploaded car models are normalised to about this length (metres). */
 const TARGET_CAR_LENGTH = 4.5
 /** At most this many library slots. */
@@ -146,6 +159,8 @@ export class TrafficSystem {
 
   /** The car library: uploaded models keyed by id. */
   private readonly models = new Map<string, CarType>()
+  /** Guards the one-time load of the default built-in cars. */
+  private defaultsLoaded = false
 
   private count = 8 // generated (box) cars
   private speed = 9 // metres per second
@@ -279,6 +294,21 @@ export class TrafficSystem {
     })
     this.rebuildCars()
     return id
+  }
+
+  /**
+   * Load the default ready-made cars once (the clean, correctly-sized ones) and
+   * drop the generated box cars to zero, so the traffic is real cars out of the
+   * box. Safe to call repeatedly — it only runs the first time.
+   */
+  async loadDefaults(): Promise<void> {
+    if (this.defaultsLoaded) return
+    this.defaultsLoaded = true
+    this.count = 0 // real cars replace the boxes
+    for (const b of BUILTIN_CARS.filter((c) => c.def)) {
+      const id = await this.addModel(b.url, b.name, '.glb')
+      if (id) this.setModelCount(id, 2)
+    }
   }
 
   setModelCount(id: string, n: number): void {
