@@ -122,11 +122,14 @@ interface CarType {
  * whether the model names its wheels so they visibly spin.
  */
 export const BUILTIN_CARS: { key: string; name: string; url: string; wheels: boolean; def: boolean; note?: string }[] = [
-  { key: 'police', name: 'شرطة (Crown Vic)', url: 'models/police_car.glb', wheels: true, def: true },
-  { key: 'mercedes', name: 'مرسيدس W201', url: 'models/mercedes_w201.glb', wheels: false, def: true },
-  { key: 'alfa', name: 'ألفا روميو 1967', url: 'models/alfa_romeo_1967.glb', wheels: false, def: false, note: 'منخفضة الارتفاع' },
-  { key: 'audi', name: 'أودي TT 2003', url: 'models/audi_tt.glb', wheels: false, def: false },
-  { key: 'pack', name: 'باقة سيارات (عدة سيارات بملف)', url: 'models/car_pack_1.glb', wheels: true, def: false, note: 'ملف فيه عدة سيارات' },
+  { key: 'sedan', name: 'سيدان', url: 'models/us_sedan.glb', wheels: true, def: true },
+  { key: 'taxi', name: 'تاكسي', url: 'models/us_taxi.glb', wheels: true, def: true },
+  { key: 'uspolice', name: 'شرطة', url: 'models/us_police.glb', wheels: true, def: true },
+  { key: 'crownvic', name: 'شرطة (Crown Vic)', url: 'models/police_car.glb', wheels: true, def: false },
+  { key: 'mercedes', name: 'مرسيدس W201', url: 'models/mercedes_w201.glb', wheels: false, def: false, note: 'عجل مدموج بالجسم' },
+  { key: 'alfa', name: 'ألفا روميو 1967', url: 'models/alfa_romeo_1967.glb', wheels: false, def: false, note: 'عجل مدموج / منخفضة' },
+  { key: 'audi', name: 'أودي TT 2003', url: 'models/audi_tt.glb', wheels: false, def: false, note: 'عجل مدموج' },
+  { key: 'pack', name: 'باقة سيارات', url: 'models/car_pack_1.glb', wheels: true, def: false, note: 'عدة سيارات بملف' },
 ]
 
 /** Uploaded car models are normalised to about this length (metres). */
@@ -720,26 +723,31 @@ export class TrafficSystem {
 
   /**
    * Find the wheel meshes of a just-cloned model (holder at identity, scale 1),
-   * returning each with its centre in holder-local space and its radius. Wheels
-   * are matched by the same name hints the vehicle loader uses.
+   * returning each with its centre in holder-local space and its radius. A hint
+   * must sit at a word boundary, so "rim" no longer matches "pRIMitive" (glTF
+   * exporters split meshes into "…_primitiveN") — that bug spun the whole car —
+   * and the steering wheel is excluded so only the road wheels turn.
    */
   private detectWheels(
     holder: TransformNode,
   ): { mesh: AbstractMesh; centerLocal: Vector3; radiusLocal: number }[] {
     const hints = DEFAULT_WHEEL_HINTS.map((h) => h.toLowerCase())
+    const wheelRe = new RegExp(`(?:^|[^a-z])(?:${hints.join('|')})`)
     const out: { mesh: AbstractMesh; centerLocal: Vector3; radiusLocal: number }[] = []
     for (const m of holder.getChildMeshes()) {
       const name = m.name.toLowerCase()
-      if (!hints.some((h) => name.includes(h))) continue
+      if (name.includes('steering') || name.includes('spare')) continue
+      if (!wheelRe.test(name)) continue
       if (!m.getTotalVertices?.()) continue
       m.computeWorldMatrix(true)
       const bb = m.getBoundingInfo().boundingBox
       const min = bb.minimumWorld
       const max = bb.maximumWorld
       const center = new Vector3((min.x + max.x) / 2, (min.y + max.y) / 2, (min.z + max.z) / 2)
-      // The wheel's radius is half of its two larger extents (the circular face).
-      const ext = [max.x - min.x, max.y - min.y, max.z - min.z].sort((a, b) => b - a)
-      const radius = (ext[0] + ext[1]) * 0.25
+      // A wheel on the ground is as tall as it is round, so its vertical extent
+      // is its diameter — this stays right whether the mesh is one wheel or a
+      // combined back axle (which is wide but no taller).
+      const radius = Math.max(0.05, (max.y - min.y) / 2)
       out.push({ mesh: m, centerLocal: center, radiusLocal: radius })
     }
     return out
