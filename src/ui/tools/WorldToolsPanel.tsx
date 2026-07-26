@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { MeshBuilder, Color3, Vector3, PointerEventTypes } from '@babylonjs/core'
 import { Panel } from '../Chrome'
+import { KhalidiyaRoad } from '../../engine/scene/KhalidiyaRoad'
 
 // The engine appears on window only after boot, so it is always accessed
 // through this narrow typed hole rather than assumed at module load. Babylon
@@ -15,6 +16,8 @@ type SimLike = {
   region?: any
   vehicle: any
   model: any
+  terrain: any
+  khalidiyaRoad?: KhalidiyaRoad
 }
 
 type SimStoreLike = {
@@ -260,9 +263,42 @@ export function WorldToolsPanel() {
     'rounded-lg bg-ink-700 px-3 py-2 text-[12px] text-mist-200 transition-colors hover:bg-ink-600'
   const btnActive = 'rounded-lg bg-brand-500 px-3 py-2 text-[12px] text-white transition-colors hover:bg-brand-400'
 
+  // --- Khalidiya road scene ----------------------------------------------
+  const [roadOn, setRoadOn] = useState(false)
+  function toggleRoad() {
+    const sim = getSim()
+    if (!sim) return
+    if (!sim.khalidiyaRoad) sim.khalidiyaRoad = new KhalidiyaRoad(sim as never)
+    if (sim.khalidiyaRoad.built) {
+      sim.khalidiyaRoad.clear()
+      setRoadOn(false)
+    } else {
+      sim.khalidiyaRoad.build()
+      setRoadOn(true)
+    }
+  }
+
   return (
     <Panel title="العالم" className="min-w-0" bodyClassName="min-h-0 overflow-y-auto p-4">
       <div className="flex flex-col gap-4" dir="rtl">
+        {/* Khalidiya road scene */}
+        <div className="flex flex-col gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-2.5">
+          <span className="text-[12px] font-medium text-amber-300">مشهد شارع الخالدية</span>
+          <p className="text-[11px] leading-4 text-mist-400">
+            شارع مزدوج بأسفلت وخطوط، جزيرة وسطية على طوله، حواجز حديدية، أرض صحراوية
+            رملية، وبيوت بلون البلد.
+          </p>
+          <button
+            type="button"
+            className={roadOn ? btnActive : btn}
+            onClick={toggleRoad}
+          >
+            {roadOn ? 'إزالة المشهد' : 'ابنِ مشهد الخالدية'}
+          </button>
+        </div>
+
+        <div className="h-px bg-ink-700" />
+
         {/* Time of day */}
         <div className="flex items-center gap-3">
           <span className="w-20 shrink-0 text-[12px] text-mist-400">الوقت</span>
