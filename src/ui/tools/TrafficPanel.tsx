@@ -57,9 +57,9 @@ export function TrafficPanel() {
   const [cars, setCars] = useState(0)
   const [editorCam, setEditorCam] = useState(false)
   const [camSpeed, setCamSpeed] = useState(() => getEditorCam()?.getSpeed() ?? 24)
-  const [models, setModels] = useState<{ id: string; name: string; count: number; flip: boolean }[]>(
-    [],
-  )
+  const [models, setModels] = useState<
+    { id: string; name: string; count: number; flip: boolean; wheels: number }[]
+  >([])
   const [uploading, setUploading] = useState(false)
 
   // Keep a live cursor into the traffic system without re-reading window each call.
@@ -399,8 +399,24 @@ export function TrafficPanel() {
               {models.map((m) => (
                 <div key={m.id} className="flex flex-col gap-1.5 rounded-md border border-ink-700 bg-ink-850 p-2">
                   <div className="flex items-center justify-between gap-2">
-                    <span className="min-w-0 flex-1 truncate text-[12px] text-mist-200" title={m.name}>
-                      {m.name}
+                    <span className="flex min-w-0 flex-1 items-center gap-1.5">
+                      <span className="min-w-0 truncate text-[12px] text-mist-200" title={m.name}>
+                        {m.name}
+                      </span>
+                      <span
+                        className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${
+                          m.wheels > 0
+                            ? 'bg-emerald-500/15 text-emerald-400'
+                            : 'bg-ink-700 text-mist-400'
+                        }`}
+                        title={
+                          m.wheels > 0
+                            ? `تم العثور على ${m.wheels} عجل — تلفّ وتنعطف`
+                            : 'لم يُعثر على عجل بالاسم — سمِّ العجل wheel/tire في الملف لتلفّ'
+                        }
+                      >
+                        {m.wheels > 0 ? `عجل ✓ ${m.wheels}` : 'بلا عجل'}
+                      </span>
                     </span>
                     <button
                       type="button"
