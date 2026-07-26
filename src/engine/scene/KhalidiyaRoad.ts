@@ -1,5 +1,6 @@
 import {
   Color3,
+  DynamicTexture,
   MeshBuilder,
   StandardMaterial,
   Vector3,
@@ -63,6 +64,8 @@ export class KhalidiyaRoad {
   private readonly scene: Scene
   private readonly meshes: AbstractMesh[] = []
   private readonly mats: StandardMaterial[] = []
+  private readonly texs: DynamicTexture[] = []
+  private facadeSeq = 0
   built = false
 
   constructor(sim: SimLike) {
@@ -81,6 +84,104 @@ export class KhalidiyaRoad {
 
   private y(x: number, z: number): number {
     return this.sim.field.surfaceHeight(x, z)
+  }
+
+  /**
+   * A painted facade texture for a house: beige stone with grain, rows of
+   * arched windows on the upper floors, and a dark shop front with a coloured
+   * sign band on the ground floor. Drawn onto a canvas so the buildings read as
+   * real Khalidiya storefronts, not flat boxes.
+   */
+  private facadeMaterial(floors: number, base: Color3): StandardMaterial {
+    const perFloor = 200
+    const texW = 420
+    const texH = perFloor * floors
+    const dt = new DynamicTexture(`khal_facade_${this.facadeSeq++}`, { width: texW, height: texH }, this.scene, true)
+    const ctx = dt.getContext() as unknown as CanvasRenderingContext2D
+    const rgb = (c: Color3, d = 0) =>
+      `rgb(${Math.round(Math.min(1, c.r + d) * 255)},${Math.round(Math.min(1, c.g + d) * 255)},${Math.round(Math.min(1, c.b + d) * 255)})`
+
+    // Stone wall + grain.
+    ctx.fillStyle = rgb(base)
+    ctx.fillRect(0, 0, texW, texH)
+    for (let i = 0; i < 2600; i++) {
+      const d = (Math.random() - 0.5) * 0.22
+      ctx.fillStyle = rgb(base, d)
+      ctx.fillRect(Math.random() * texW, Math.random() * texH, 1 + Math.random() * 2, 1 + Math.random() * 2)
+    }
+    const floorH = texH / floors
+
+    // Floor divider lines.
+    ctx.strokeStyle = 'rgba(0,0,0,0.16)'
+    ctx.lineWidth = 2
+    for (let f = 1; f < floors; f++) {
+      const yy = f * floorH
+      ctx.beginPath()
+      ctx.moveTo(0, yy)
+      ctx.lineTo(texW, yy)
+      ctx.stroke()
+    }
+
+    const cols = 3
+    const cellW = texW / cols
+    const wW = cellW * 0.5
+    const wH = floorH * 0.5
+
+    const arch = (x: number, y: number, w: number, h: number) => {
+      const r = w / 2
+      const frame = () => {
+        ctx.moveTo(x, y + h)
+        ctx.lineTo(x, y + r)
+        ctx.arc(x + r, y + r, r, Math.PI, 0)
+        ctx.lineTo(x + w, y + h)
+        ctx.closePath()
+      }
+      ctx.fillStyle = 'rgb(232,226,214)' // light frame
+      ctx.beginPath()
+      frame()
+      ctx.fill()
+      const ins = w * 0.16
+      ctx.fillStyle = 'rgb(58,74,90)' // dark glass
+      ctx.beginPath()
+      ctx.moveTo(x + ins, y + h - ins)
+      ctx.lineTo(x + ins, y + r)
+      ctx.arc(x + r, y + r, Math.max(1, r - ins), Math.PI, 0)
+      ctx.lineTo(x + w - ins, y + h - ins)
+      ctx.closePath()
+      ctx.fill()
+    }
+
+    // Upper floors get window rows (ground floor is the bottom band).
+    for (let f = 0; f < floors - 1; f++) {
+      const top = f * floorH
+      for (let c = 0; c < cols; c++) {
+        arch(c * cellW + (cellW - wW) / 2, top + floorH * 0.28, wW, wH)
+      }
+    }
+
+    // Ground floor: dark shopfront + shutters + a coloured sign band.
+    const gTop = (floors - 1) * floorH
+    ctx.fillStyle = 'rgb(38,38,43)'
+    ctx.fillRect(0, gTop + floorH * 0.2, texW, floorH * 0.8)
+    ctx.strokeStyle = 'rgba(95,95,102,0.55)'
+    ctx.lineWidth = 1
+    for (let x = 5; x < texW; x += 7) {
+      ctx.beginPath()
+      ctx.moveTo(x, gTop + floorH * 0.34)
+      ctx.lineTo(x, gTop + floorH)
+      ctx.stroke()
+    }
+    const signs = ['#b23b2e', '#141414', '#1e5aa8', '#b8862a', '#2e7d46']
+    ctx.fillStyle = signs[Math.floor(Math.random() * signs.length)]
+    ctx.fillRect(0, gTop + floorH * 0.03, texW, floorH * 0.16)
+
+    dt.update()
+    const m = new StandardMaterial(`khal_facademat_${this.facadeSeq}`, this.scene)
+    m.diffuseTexture = dt
+    m.specularColor = new Color3(0.04, 0.04, 0.04)
+    this.texs.push(dt)
+    this.mats.push(m)
+    return m
   }
 
   /**
@@ -190,14 +291,15 @@ export class KhalidiyaRoad {
       const dist = CX + CARRIAGE_W / 2 + 8 + Math.random() * 34
       const x = side * dist
       const z = -HALF_LEN + 30 + Math.random() * (HALF_LEN * 2 - 60)
-      const w = 5 + Math.random() * 6
-      const d = 5 + Math.random() * 6
-      const h = 3 + Math.random() * 5
+      const w = 6 + Math.random() * 7
+      const d = 6 + Math.random() * 7
+      const floors = 2 + Math.floor(Math.random() * 2) // 2–3 storeys
+      const h = floors * 3.3
       const gy = this.y(x, z)
       const b = MeshBuilder.CreateBox(`khal_house_${i}`, { width: w, height: h, depth: d }, this.scene)
       b.position.set(x, gy + h / 2, z)
-      // A little self-lit so the sand colour reads even on shadowed faces.
-      b.material = this.mat(`house_${i}`, C.house[i % C.house.length], { unlit: true })
+      // A painted stone-and-shopfront facade, not a flat colour.
+      b.material = this.facadeMaterial(floors, C.house[i % C.house.length])
       b.isPickable = false
       this.meshes.push(b)
     }
@@ -213,5 +315,7 @@ export class KhalidiyaRoad {
     this.meshes.length = 0
     for (const m of this.mats) m.dispose()
     this.mats.length = 0
+    for (const t of this.texs) t.dispose()
+    this.texs.length = 0
   }
 }
