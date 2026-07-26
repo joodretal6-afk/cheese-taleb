@@ -1,16 +1,19 @@
 import {
   Color3,
-  ImportMeshAsync,
+  LoadAssetContainerAsync,
   Matrix,
-  Mesh,
   MeshBuilder,
   Quaternion,
   StandardMaterial,
   TransformNode,
   Vector3,
   type AbstractMesh,
+  type AnimationGroup,
+  type AssetContainer,
   type LinesMesh,
+  type Node,
   type Scene,
+  type Skeleton,
 } from '@babylonjs/core'
 import '@babylonjs/loaders/glTF'
 
@@ -25,10 +28,11 @@ import '@babylonjs/loaders/glTF'
  *   - generated: a little articulated figure (torso, head, two legs, two arms)
  *     whose limbs swing by the real distance covered, so it reads as walking
  *     without any imported animation.
- *   - model: an uploaded GLB character, cloned per walker, normalised to human
- *     height and given a gentle walking bob and sway. (Independent skeletal
- *     animation per clone is deliberately avoided — it is fragile across
- *     arbitrary rigs — so movement is procedural and always works.)
+ *   - model: an uploaded GLB character, instantiated per walker so each gets its
+ *     own skeleton and its own copy of the animation clips. If the model ships a
+ *     skeletal walk clip we play it looping, so the real arms and legs move; if
+ *     it is a static mesh with no rig, the walker falls back to a procedural bob
+ *     (there are no joints to move).
  *
  * Self-contained: it reaches the world only through the scene and a getter for
  * the current mud field, exactly like the traffic system, so a world rebuild
@@ -41,7 +45,7 @@ interface Path {
   seg: number[]
   total: number
   line: LinesMesh | null
-  markers: Mesh[]
+  markers: AbstractMesh[]
 }
 
 interface Walker {
@@ -58,15 +62,20 @@ interface Walker {
   dist: number
   isModel: boolean
   flip: boolean
+  /** True when a real skeletal walk clip is playing (no procedural bob then). */
+  animated: boolean
+  /** Instantiated nodes/clips/skeletons to dispose with the walker. */
+  instanced?: { roots: Node[]; groups: AnimationGroup[]; skeletons: Skeleton[] }
 }
 
 interface PersonType {
   id: string
   name: string
   count: number
-  template: TransformNode
-  /** Tallest dimension of the template, to normalise to human height. */
-  tallest: number
+  /** The loaded asset, instantiated per walker so each gets its own skeleton. */
+  container: AssetContainer
+  /** Whether the model ships a skeletal animation we can play. */
+  hasAnim: boolean
   flip: boolean
 }
 
@@ -186,6 +195,11 @@ export class PedestrianSystem {
 
   setSpeed(mps: number): void {
     this.speed = Math.max(0, mps)
+    // Keep skeletal walk cadence roughly in step with the new ground speed.
+    const ratio = this.animRatio()
+    for (const w of this.walkers) {
+      if (w.animated && w.instanced) for (const g of w.instanced.groups) g.speedRatio = ratio
+    }
   }
 
   getSpeed(): number {
@@ -208,19 +222,24 @@ export class PedestrianSystem {
 
   async addModel(url: string, name: string, ext?: string): Promise<string | null> {
     if (this.models.size >= MAX_PERSON_TYPES) return null
-    const loaded = await this.loadTemplate(url, ext)
+    const loaded = await this.loadCharacter(url, ext)
     if (!loaded) return null
     const id = `personType_${this.seq++}`
     this.models.set(id, {
       id,
       name: name || `شخصية ${this.models.size + 1}`,
       count: 3,
-      template: loaded.node,
-      tallest: loaded.tallest,
+      container: loaded.container,
+      hasAnim: loaded.hasAnim,
       flip: false,
     })
     this.rebuild()
     return id
+  }
+
+  /** Does an uploaded model carry its own skeletal walk animation? */
+  modelIsAnimated(id: string): boolean {
+    return this.models.get(id)?.hasAnim ?? false
   }
 
   setModelCount(id: string, n: number): void {
@@ -240,13 +259,19 @@ export class PedestrianSystem {
   removeModel(id: string): void {
     const t = this.models.get(id)
     if (!t) return
-    t.template.dispose()
+    t.container.dispose()
     this.models.delete(id)
     this.rebuild()
   }
 
-  listModels(): { id: string; name: string; count: number; flip: boolean }[] {
-    return [...this.models.values()].map((t) => ({ id: t.id, name: t.name, count: t.count, flip: t.flip }))
+  listModels(): { id: string; name: string; count: number; flip: boolean; animated: boolean }[] {
+    return [...this.models.values()].map((t) => ({
+      id: t.id,
+      name: t.name,
+      count: t.count,
+      flip: t.flip,
+      animated: t.hasAnim,
+    }))
   }
 
   // ------------------------------------------------------------------ ground pick
@@ -310,7 +335,10 @@ export class PedestrianSystem {
   private animateWalker(w: Walker): void {
     const phase = w.dist * GAIT_RATE
     if (w.isModel) {
-      // A gentle bob and side-sway so an imported figure reads as walking.
+      // A model with its own skeletal walk clip animates itself — leave it be.
+      if (w.animated) return
+      // Otherwise (a static mesh, no rig) a gentle bob and sway so it at least
+      // reads as walking.
       const bob = Math.abs(Math.sin(phase)) * 0.05
       w.holder.position.y += bob
       const sway = Math.sin(phase) * 0.03
@@ -492,28 +520,74 @@ export class PedestrianSystem {
       dist: Math.random() * 3, // desync the gait
       isModel: false,
       flip: false,
+      animated: false,
     }
   }
 
-  /** A walker cloned from an uploaded character model. */
+  /**
+   * A walker built from an uploaded character. The asset is instantiated (not
+   * shallow-cloned), so this walker gets its OWN skeleton and its OWN copies of
+   * the animation clips — which is what lets the real walk cycle play per
+   * person. If the model carries a skeletal clip we start it looping; if it is a
+   * static mesh with no rig, there is nothing to animate and the walker falls
+   * back to the procedural bob.
+   *
+   * Nesting: holder (placed/rotated each frame) → pivot (scale to human height)
+   * → align (re-seat so the model is centred on x/z with feet on y = 0) → the
+   * instantiated roots.
+   */
   private buildModelWalker(path: Path, type: PersonType): Walker {
     const id = this.seq++
     const holder = new TransformNode(`ped_${id}`, this.scene)
     holder.rotationQuaternion = new Quaternion()
-    const inner = new TransformNode(`ped_inner_${id}`, this.scene)
-    inner.parent = holder
-    const meshes: AbstractMesh[] = [inner as unknown as AbstractMesh]
+    const pivot = new TransformNode(`ped_pivot_${id}`, this.scene)
+    pivot.parent = holder
+    const align = new TransformNode(`ped_modelgeo_${id}`, this.scene)
+    align.parent = pivot
 
-    const clone = type.template.clone(`ped_modelgeo_${id}`, inner)
-    if (clone) {
-      clone.setEnabled(true)
-      for (const m of clone.getChildMeshes()) {
+    const entries = type.container.instantiateModelsToScene(
+      (n) => `ped_inst_${id}_${n}`,
+      false,
+      { doNotInstantiate: false },
+    )
+    const meshes: AbstractMesh[] = [align as unknown as AbstractMesh]
+    for (const root of entries.rootNodes) root.parent = align
+    for (const root of entries.rootNodes) {
+      root.computeWorldMatrix(true)
+      for (const m of root.getChildMeshes()) {
         m.isPickable = false
         meshes.push(m)
       }
-      if (clone instanceof Mesh) meshes.push(clone)
     }
-    inner.scaling.setAll(HUMAN_HEIGHT / type.tallest)
+
+    // Measure the instance (all parents identity so far) to normalise + re-seat.
+    const min = new Vector3(Infinity, Infinity, Infinity)
+    const max = new Vector3(-Infinity, -Infinity, -Infinity)
+    for (const m of meshes) {
+      const mesh = m as AbstractMesh
+      if (typeof mesh.getBoundingInfo !== 'function' || !mesh.getTotalVertices?.()) continue
+      mesh.computeWorldMatrix(true)
+      const bb = mesh.getBoundingInfo().boundingBox
+      min.minimizeInPlace(bb.minimumWorld)
+      max.maximizeInPlace(bb.maximumWorld)
+    }
+    const height = Math.max(0.01, max.y - min.y)
+    align.position.set(-(min.x + max.x) / 2, -min.y, -(min.z + max.z) / 2)
+    pivot.scaling.setAll(HUMAN_HEIGHT / height)
+
+    // Play the walk clip, looping, on this instance's own copy of the animation.
+    const groups = entries.animationGroups
+    let animated = false
+    if (groups.length) {
+      const walk =
+        groups.find((g) => /walk|run|move|loco/i.test(g.name)) ?? groups[0]
+      for (const g of groups) g.stop()
+      walk.speedRatio = this.animRatio()
+      walk.start(true)
+      // Desync the crowd so they don't all step in unison.
+      walk.goToFrame(walk.from + Math.random() * Math.max(1, walk.to - walk.from))
+      animated = true
+    }
 
     return {
       holder,
@@ -526,44 +600,31 @@ export class PedestrianSystem {
       dist: Math.random() * 3,
       isModel: true,
       flip: type.flip,
+      animated,
+      instanced: { roots: entries.rootNodes, groups, skeletons: entries.skeletons },
     }
   }
 
-  private async loadTemplate(
+  /** Load an uploaded character as an asset container (kept for instancing). */
+  private async loadCharacter(
     url: string,
     ext?: string,
-  ): Promise<{ node: TransformNode; tallest: number } | null> {
+  ): Promise<{ container: AssetContainer; hasAnim: boolean } | null> {
     try {
-      const result = await ImportMeshAsync(url, this.scene, { pluginExtension: ext })
-      const meshes = result.meshes.filter((m): m is Mesh => m instanceof Mesh && !!m.getTotalVertices())
-      if (meshes.length === 0) {
-        for (const m of result.meshes) m.dispose()
-        return null
-      }
-      const template = new TransformNode(`personTemplate_${this.seq++}`, this.scene)
-      for (const m of meshes) m.setParent(template)
-      for (const m of result.meshes) if (m.name === '__root__') m.dispose()
-      template.computeWorldMatrix(true)
-
-      const min = new Vector3(Infinity, Infinity, Infinity)
-      const max = new Vector3(-Infinity, -Infinity, -Infinity)
-      for (const m of meshes) {
-        m.computeWorldMatrix(true)
-        const bb = m.getBoundingInfo().boundingBox
-        min.minimizeInPlace(bb.minimumWorld)
-        max.maximizeInPlace(bb.maximumWorld)
-      }
-      // Re-seat centred on x/z with feet on y = 0.
-      for (const m of meshes) {
-        m.position.subtractInPlace(new Vector3((min.x + max.x) / 2, min.y, (min.z + max.z) / 2))
-      }
-      const tallest = Math.max(0.01, max.y - min.y)
-      template.setEnabled(false)
-      return { node: template, tallest }
+      const container = await LoadAssetContainerAsync(url, this.scene, { pluginExtension: ext })
+      const hasAnim = container.animationGroups.length > 0
+      // Stop the container's template clips; instances get their own to play.
+      for (const g of container.animationGroups) g.stop()
+      return { container, hasAnim }
     } catch (err) {
       console.error('[pedestrian] could not load character model', url, err)
       return null
     }
+  }
+
+  /** Animation playback speed, scaled to the walking speed for a natural gait. */
+  private animRatio(): number {
+    return Math.max(0.4, Math.min(2.2, this.speed / 1.3))
   }
 
   private buildMaterials(): void {
@@ -635,6 +696,11 @@ export class PedestrianSystem {
   }
 
   private disposeWalker(w: Walker): void {
+    if (w.instanced) {
+      for (const g of w.instanced.groups) g.dispose()
+      for (const s of w.instanced.skeletons) s.dispose()
+      for (const r of w.instanced.roots) r.dispose()
+    }
     for (const m of w.meshes) m.dispose()
     for (const l of w.legs) l.dispose()
     for (const a of w.arms) a.dispose()
@@ -652,7 +718,7 @@ export class PedestrianSystem {
     this.cancelPath()
     for (const p of this.paths) this.disposePath(p)
     this.paths.length = 0
-    for (const t of this.models.values()) t.template.dispose()
+    for (const t of this.models.values()) t.container.dispose()
     this.models.clear()
     for (const m of this.shirtMats) m.dispose()
     this.skinMat?.dispose()

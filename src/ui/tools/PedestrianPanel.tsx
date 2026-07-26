@@ -53,7 +53,9 @@ export function PedestrianPanel() {
   const [walkers, setWalkers] = useState(0)
   const [editorCam, setEditorCam] = useState(false)
   const [camSpeed, setCamSpeed] = useState(() => getEditorCam()?.getSpeed() ?? 24)
-  const [models, setModels] = useState<{ id: string; name: string; count: number; flip: boolean }[]>([])
+  const [models, setModels] = useState<
+    { id: string; name: string; count: number; flip: boolean; animated: boolean }[]
+  >([])
   const [uploading, setUploading] = useState(false)
 
   const sysRef = useRef<PedestrianSystem | undefined>(undefined)
@@ -351,15 +353,33 @@ export function PedestrianPanel() {
           </div>
           {models.length === 0 ? (
             <p className="text-[11px] leading-4 text-mist-400">
-              ارفع ملف GLB لشخصية ليصير طرازاً — وحدد كم شخصاً من كل شكل.
+              ارفع ملف GLB لشخصية ليصير طرازاً — وحدد كم شخصاً من كل شكل. لو الملف
+              يحوي أنيميشن مشي (هيكل عظمي) رح تتحرك أطرافه طبيعياً؛ لو كان مجسّماً
+              ثابتاً بلا هيكل فما في مفاصل تتحرك.
             </p>
           ) : (
             <div className="flex flex-col gap-2">
               {models.map((m) => (
                 <div key={m.id} className="flex flex-col gap-1.5 rounded-md border border-ink-700 bg-ink-850 p-2">
                   <div className="flex items-center justify-between gap-2">
-                    <span className="min-w-0 flex-1 truncate text-[12px] text-mist-200" title={m.name}>
-                      {m.name}
+                    <span className="flex min-w-0 flex-1 items-center gap-1.5">
+                      <span className="min-w-0 truncate text-[12px] text-mist-200" title={m.name}>
+                        {m.name}
+                      </span>
+                      <span
+                        className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${
+                          m.animated
+                            ? 'bg-emerald-500/15 text-emerald-400'
+                            : 'bg-ink-700 text-mist-400'
+                        }`}
+                        title={
+                          m.animated
+                            ? 'الملف يحوي أنيميشن — الأطراف تتحرك'
+                            : 'الملف بدون هيكل/أنيميشن — حركة تمايل فقط'
+                        }
+                      >
+                        {m.animated ? 'متحرك ✓' : 'بدون حركة'}
+                      </span>
                     </span>
                     <button
                       type="button"
