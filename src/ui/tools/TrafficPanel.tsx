@@ -57,6 +57,10 @@ export function TrafficPanel() {
   const [cars, setCars] = useState(0)
   const [editorCam, setEditorCam] = useState(false)
   const [camSpeed, setCamSpeed] = useState(() => getEditorCam()?.getSpeed() ?? 24)
+  const [models, setModels] = useState<{ id: string; name: string; count: number; flip: boolean }[]>(
+    [],
+  )
+  const [uploading, setUploading] = useState(false)
 
   // Keep a live cursor into the traffic system without re-reading window each call.
   const sysRef = useRef<TrafficSystem | undefined>(undefined)
@@ -72,6 +76,7 @@ export function TrafficPanel() {
     setRunning(t.running)
     setCars(t.carCount())
     setDrawing(t.drawing)
+    setModels(t.listModels())
   }
 
   // While drawing, each ground click drops a waypoint. Marching the field ray
@@ -195,6 +200,49 @@ export function TrafficPanel() {
     sysRef.current?.setSpeed(v)
   }
 
+  // --- Car library --------------------------------------------------------
+  function refreshModels() {
+    const t = sysRef.current
+    if (!t) return
+    setModels(t.listModels())
+    setCars(t.carCount())
+  }
+
+  async function uploadModel(file: File | undefined) {
+    const t = sysRef.current
+    if (!file || !t) return
+    setUploading(true)
+    try {
+      // A blob URL (not base64): a car GLB is megabytes and the loader reads a
+      // URL directly. The blob carries no extension, so pass it explicitly or
+      // Babylon can't pick the glTF loader.
+      const url = URL.createObjectURL(file)
+      const name = file.name.replace(/\.(glb|gltf)$/i, '')
+      const ext = /\.gltf$/i.test(file.name) ? '.gltf' : '.glb'
+      const id = await t.addModel(url, name, ext)
+      if (id) refreshModels()
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  function applyModelCount(id: string, n: number) {
+    const t = sysRef.current
+    if (!t) return
+    t.setModelCount(id, n)
+    refreshModels()
+  }
+
+  function toggleModelFlip(id: string, flip: boolean) {
+    sysRef.current?.setModelFlip(id, flip)
+    refreshModels()
+  }
+
+  function removeModel(id: string) {
+    sysRef.current?.removeModel(id)
+    refreshModels()
+  }
+
   function togglePlay() {
     const t = sysRef.current
     if (!t) return
@@ -302,9 +350,9 @@ export function TrafficPanel() {
 
         <div className="h-px bg-ink-700" />
 
-        {/* Fleet size ----------------------------------------------------- */}
+        {/* Fleet size (generated cars) ------------------------------------ */}
         <div className="flex items-center gap-3">
-          <span className="w-20 shrink-0 text-[12px] text-mist-400">عدد السيارات</span>
+          <span className="w-24 shrink-0 text-[12px] text-mist-400">سيارات افتراضية</span>
           <input
             type="range"
             className="h-4 min-w-0 flex-1"
@@ -312,12 +360,85 @@ export function TrafficPanel() {
             max={60}
             step={1}
             value={count}
-            aria-label="عدد السيارات"
+            aria-label="عدد السيارات الافتراضية"
             onChange={(e) => applyCount(Number(e.target.value))}
           />
           <span className="w-10 shrink-0 text-end text-[12px] tabular-nums text-mist-300">
             {count}
           </span>
+        </div>
+
+        {/* Car library ---------------------------------------------------- */}
+        <div className="flex flex-col gap-2 rounded-lg border border-ink-700 bg-ink-900/40 p-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[12px] font-medium text-mist-300">
+              مكتبة السيارات
+              <span className="text-mist-500"> ({models.length}/50)</span>
+            </span>
+            <label
+              className={`cursor-pointer rounded-lg px-3 py-1.5 text-[12px] transition-colors ${
+                uploading ? 'bg-ink-700 text-mist-400' : 'bg-brand-500 text-white hover:bg-brand-400'
+              }`}
+            >
+              {uploading ? '…جارٍ' : '+ ارفع شكل'}
+              <input
+                type="file"
+                accept=".glb,.gltf,model/gltf-binary"
+                className="hidden"
+                disabled={uploading || models.length >= 50}
+                onChange={(e) => void uploadModel(e.target.files?.[0])}
+              />
+            </label>
+          </div>
+          {models.length === 0 ? (
+            <p className="text-[11px] leading-4 text-mist-400">
+              ارفع ملف GLB لسيارة ليصير طرازاً — وحدد كم سيارة من كل طراز تولّدها.
+            </p>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {models.map((m) => (
+                <div key={m.id} className="flex flex-col gap-1.5 rounded-md border border-ink-700 bg-ink-850 p-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="min-w-0 flex-1 truncate text-[12px] text-mist-200" title={m.name}>
+                      {m.name}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => removeModel(m.id)}
+                      className="shrink-0 text-[11px] text-mist-400 hover:text-red-400"
+                      title="حذف الطراز"
+                    >
+                      حذف
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="w-14 shrink-0 text-[11px] text-mist-400">العدد</span>
+                    <input
+                      type="range"
+                      className="h-4 min-w-0 flex-1"
+                      min={0}
+                      max={30}
+                      step={1}
+                      value={m.count}
+                      aria-label={`عدد ${m.name}`}
+                      onChange={(e) => applyModelCount(m.id, Number(e.target.value))}
+                    />
+                    <span className="w-8 shrink-0 text-end text-[11px] tabular-nums text-mist-300">
+                      {m.count}
+                    </span>
+                  </div>
+                  <label className="flex cursor-pointer items-center gap-2 text-[11px] text-mist-400">
+                    <input
+                      type="checkbox"
+                      checked={m.flip}
+                      onChange={(e) => toggleModelFlip(m.id, e.target.checked)}
+                    />
+                    اقلب الاتجاه (لو السيارة تسير للخلف)
+                  </label>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Speed ---------------------------------------------------------- */}

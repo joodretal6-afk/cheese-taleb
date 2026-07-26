@@ -1,6 +1,8 @@
 import {
   Color3,
+  ImportMeshAsync,
   Matrix,
+  Mesh,
   MeshBuilder,
   Quaternion,
   StandardMaterial,
@@ -8,9 +10,9 @@ import {
   Vector3,
   type AbstractMesh,
   type LinesMesh,
-  type Mesh,
   type Scene,
 } from '@babylonjs/core'
+import '@babylonjs/loaders/glTF'
 
 /**
  * Traffic.
@@ -67,7 +69,27 @@ interface Car {
   wheelRadius: number
   /** Accumulated wheel spin, radians. */
   spin: number
+  /** A model whose front points the wrong way is turned 180° here. */
+  flip: boolean
 }
+
+/** One entry in the car library: an uploaded model and how many to spawn. */
+interface CarType {
+  id: string
+  name: string
+  count: number
+  /** The loaded, base-seated template cloned per car. */
+  template: TransformNode
+  /** Longest horizontal side of the template, for scaling to a car length. */
+  longest: number
+  /** Front points the wrong way? Turn every car of this type around. */
+  flip: boolean
+}
+
+/** Uploaded car models are normalised to about this length (metres). */
+const TARGET_CAR_LENGTH = 4.5
+/** At most this many library slots. */
+const MAX_CAR_TYPES = 50
 
 const BODY_COLORS: [number, number, number][] = [
   [0.82, 0.24, 0.22], // red
@@ -88,7 +110,10 @@ export class TrafficSystem {
   private active: Lane | null = null
   private readonly cars: Car[] = []
 
-  private count = 8
+  /** The car library: uploaded models keyed by id. */
+  private readonly models = new Map<string, CarType>()
+
+  private count = 8 // generated (box) cars
   private speed = 9 // metres per second
   private playing = false
 
@@ -190,6 +215,62 @@ export class TrafficSystem {
     return this.speed
   }
 
+  // ------------------------------------------------------------- car library
+
+  /**
+   * Add an uploaded GLB as a car type. Loads it once into a template that is
+   * cloned per car, normalised so its longest side is about a car length and
+   * re-seated so its wheels sit on the ground. Returns the type id, or null on
+   * a failed load or when the library is full.
+   */
+  async addModel(url: string, name: string, ext?: string): Promise<string | null> {
+    if (this.models.size >= MAX_CAR_TYPES) return null
+    const loaded = await this.loadTemplate(url, ext)
+    if (!loaded) return null
+    const id = `carType_${this.seq++}`
+    this.models.set(id, {
+      id,
+      name: name || `طراز ${this.models.size + 1}`,
+      count: 3,
+      template: loaded.node,
+      longest: loaded.longest,
+      flip: false,
+    })
+    this.rebuildCars()
+    return id
+  }
+
+  setModelCount(id: string, n: number): void {
+    const t = this.models.get(id)
+    if (!t) return
+    t.count = Math.max(0, Math.min(50, Math.round(n)))
+    this.rebuildCars()
+  }
+
+  setModelFlip(id: string, flip: boolean): void {
+    const t = this.models.get(id)
+    if (!t) return
+    t.flip = flip
+    this.rebuildCars()
+  }
+
+  removeModel(id: string): void {
+    const t = this.models.get(id)
+    if (!t) return
+    t.template.dispose()
+    this.models.delete(id)
+    this.rebuildCars()
+  }
+
+  listModels(): { id: string; name: string; count: number; flip: boolean }[] {
+    return [...this.models.values()].map((t) => ({
+      id: t.id,
+      name: t.name,
+      count: t.count,
+      flip: t.flip,
+    }))
+  }
+
   play(): void {
     this.playing = this.lanes.length > 0
   }
@@ -286,6 +367,8 @@ export class TrafficSystem {
     let fwd = new Vector3(this._tan.x, 0, this._tan.z)
     if (fwd.lengthSquared() < 1e-9) fwd.set(0, 0, 1)
     fwd.normalize()
+    // A model whose front faces the other way is turned around here.
+    if (car.flip) fwd.negateInPlace()
     // Re-orthogonalise forward against the slope's up so the car sits flat.
     const right = Vector3.Cross(up, fwd)
     right.normalize()
@@ -347,19 +430,29 @@ export class TrafficSystem {
     this.cars.length = 0
 
     const usable = this.lanes.filter((l) => l.total > 1e-3)
-    if (usable.length === 0 || this.count === 0) {
-      if (this.cars.length === 0) this.playing = this.playing && usable.length > 0
+    if (usable.length === 0) {
+      this.playing = false
       return
     }
 
-    // Spread the fleet round-robin across lanes, then evenly along each lane.
+    // One factory per car to spawn: the generated box cars first, then every
+    // library model repeated by its own count. Flattening to a single list lets
+    // the whole mixed fleet spread evenly across the lanes together.
+    const factories: ((lane: Lane, idx: number) => Car)[] = []
+    for (let i = 0; i < this.count; i++) factories.push((lane, idx) => this.buildCar(lane, idx))
+    for (const t of this.models.values()) {
+      for (let i = 0; i < t.count; i++) factories.push((lane) => this.buildModelCar(lane, t))
+    }
+    if (factories.length === 0) return
+
     const perLane: Car[][] = usable.map(() => [])
-    for (let i = 0; i < this.count; i++) {
+    factories.forEach((make, i) => {
       const lane = usable[i % usable.length]
-      const car = this.buildCar(lane, i)
+      const car = make(lane, i)
       this.cars.push(car)
       perLane[i % usable.length].push(car)
-    }
+    })
+
     const field = this.field
     for (let li = 0; li < usable.length; li++) {
       const group = perLane[li]
@@ -370,6 +463,38 @@ export class TrafficSystem {
         // already lined up along the path rather than piled at the origin.
         if (field) this.placeCar(group[j], field)
       }
+    }
+  }
+
+  /** A car cloned from an uploaded library model. */
+  private buildModelCar(lane: Lane, type: CarType): Car {
+    const id = this.seq++
+    const holder = new TransformNode(`traffic_car_${id}`, this.scene)
+    holder.rotationQuaternion = new Quaternion()
+
+    const meshes: AbstractMesh[] = []
+    const clone = type.template.clone(`traffic_modelgeo_${id}`, holder)
+    if (clone) {
+      clone.setEnabled(true)
+      for (const m of clone.getChildMeshes()) {
+        m.isPickable = false
+        meshes.push(m)
+      }
+      if (clone instanceof Mesh) meshes.push(clone)
+    }
+    // Normalise to a car length; the template already sits with its base on y=0.
+    holder.scaling.setAll(TARGET_CAR_LENGTH / type.longest)
+
+    return {
+      holder,
+      wheels: [],
+      meshes,
+      lane,
+      s: 0,
+      speedMul: 0.82 + Math.random() * 0.4,
+      wheelRadius: 0.38,
+      spin: 0,
+      flip: type.flip,
     }
   }
 
@@ -444,6 +569,51 @@ export class TrafficSystem {
       speedMul: 0.82 + Math.random() * 0.4,
       wheelRadius,
       spin: 0,
+      flip: false,
+    }
+  }
+
+  /**
+   * Load a GLB into a template node: drop the loader's handedness root, measure
+   * the footprint, and re-seat so the model is centred on x/z with its base on
+   * y = 0 — so a clone placed at a ground point stands on it. Mirrors the
+   * brush's model loader.
+   */
+  private async loadTemplate(
+    url: string,
+    ext?: string,
+  ): Promise<{ node: TransformNode; longest: number } | null> {
+    try {
+      const result = await ImportMeshAsync(url, this.scene, { pluginExtension: ext })
+      const meshes = result.meshes.filter(
+        (m): m is Mesh => m instanceof Mesh && !!m.getTotalVertices(),
+      )
+      if (meshes.length === 0) {
+        for (const m of result.meshes) m.dispose()
+        return null
+      }
+      const template = new TransformNode(`carTemplate_${this.seq++}`, this.scene)
+      for (const m of meshes) m.setParent(template)
+      for (const m of result.meshes) if (m.name === '__root__') m.dispose()
+      template.computeWorldMatrix(true)
+
+      const min = new Vector3(Infinity, Infinity, Infinity)
+      const max = new Vector3(-Infinity, -Infinity, -Infinity)
+      for (const m of meshes) {
+        m.computeWorldMatrix(true)
+        const bb = m.getBoundingInfo().boundingBox
+        min.minimizeInPlace(bb.minimumWorld)
+        max.maximizeInPlace(bb.maximumWorld)
+      }
+      for (const m of meshes) {
+        m.position.subtractInPlace(new Vector3((min.x + max.x) / 2, min.y, (min.z + max.z) / 2))
+      }
+      const longest = Math.max(0.01, Math.max(max.x - min.x, max.z - min.z))
+      template.setEnabled(false)
+      return { node: template, longest }
+    } catch (err) {
+      console.error('[traffic] could not load car model', url, err)
+      return null
     }
   }
 
@@ -535,6 +705,8 @@ export class TrafficSystem {
     this.cancelLane()
     for (const l of this.lanes) this.disposeLane(l)
     this.lanes.length = 0
+    for (const t of this.models.values()) t.template.dispose()
+    this.models.clear()
     for (const m of this.bodyMats) m.dispose()
     this.wheelMat?.dispose()
     this.glassMat?.dispose()
