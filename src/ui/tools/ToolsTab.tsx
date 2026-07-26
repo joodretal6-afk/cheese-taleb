@@ -4,18 +4,19 @@ import { ObjectToolsPanel } from './ObjectToolsPanel'
 import { SceneIOPanel } from './SceneIOPanel'
 import { DevHudPanel } from './DevHudPanel'
 import { WorldToolsPanel } from './WorldToolsPanel'
+import { TrafficPanel } from './TrafficPanel'
 
 /**
  * The developer-tools drawer.
  *
- * Five self-contained panels — camera, object editing, project I/O, the
- * developer HUD and world/measure tools — behind one row of sub-tabs, so the
- * main tab bar stays short and each tool still gets the full column height. All
- * five operate on the already-exposed `window.sim`; nothing here reaches into
- * the engine's internals.
+ * Six self-contained panels — camera, object editing, project I/O, the
+ * developer HUD, world/measure tools and traffic — behind one row of sub-tabs,
+ * so the main tab bar stays short and each tool still gets the full column
+ * height. All operate on the already-exposed `window.sim`; nothing here reaches
+ * into the engine's internals.
  */
 
-type Tool = 'camera' | 'objects' | 'project' | 'dev' | 'world'
+type Tool = 'camera' | 'objects' | 'project' | 'dev' | 'world' | 'traffic'
 
 const TOOLS: { id: Tool; label: string; Panel: () => React.JSX.Element }[] = [
   { id: 'camera', label: 'الكاميرا', Panel: CameraToolsPanel },
@@ -23,6 +24,7 @@ const TOOLS: { id: Tool; label: string; Panel: () => React.JSX.Element }[] = [
   { id: 'project', label: 'المشروع', Panel: SceneIOPanel },
   { id: 'dev', label: 'المطوّر', Panel: DevHudPanel },
   { id: 'world', label: 'العالم', Panel: WorldToolsPanel },
+  { id: 'traffic', label: 'المرور', Panel: TrafficPanel },
 ]
 
 export function ToolsTab() {
