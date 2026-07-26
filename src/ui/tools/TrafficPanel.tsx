@@ -481,6 +481,19 @@ export function TrafficPanel() {
             ارسم مساراً واحداً على الأقل ثم شغّل الحركة.
           </p>
         )}
+
+        <div className="h-px bg-ink-700" />
+
+        {/* GTA-style hint ------------------------------------------------- */}
+        <div className="flex flex-col gap-1 rounded-lg border border-ink-700 bg-ink-900/40 p-2.5">
+          <span className="text-[12px] font-medium text-mist-300">القيادة والسرقة</span>
+          <p className="text-[11px] leading-4 text-mist-400">
+            وأنت راجل (اخرج من مركبتك بـ<kbd className="rounded bg-ink-700 px-1 font-mono" dir="ltr">F</kbd>)
+            السيارات تهدأ وتقف إذا وقفت أمامها. اقترب من سيارة من مكتبة الطُرز واضغط
+            <kbd className="mx-1 rounded bg-ink-700 px-1 font-mono" dir="ltr">F</kbd>
+            لتسرقها وتقودها. (السيارات الصندوقية للزينة فقط — الطُرز المرفوعة هي التي تُسرق.)
+          </p>
+        </div>
       </div>
     </Panel>
   )

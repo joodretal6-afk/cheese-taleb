@@ -71,6 +71,8 @@ interface Car {
   spin: number
   /** A model whose front points the wrong way is turned 180° here. */
   flip: boolean
+  /** Present on library-model cars: what's needed to hijack and drive it. */
+  source?: { url: string; name: string; ext: string }
 }
 
 /** One entry in the car library: an uploaded model and how many to spawn. */
@@ -84,12 +86,17 @@ interface CarType {
   longest: number
   /** Front points the wrong way? Turn every car of this type around. */
   flip: boolean
+  /** The GLB URL/ext this was loaded from, so a hijack can drive it. */
+  url: string
+  ext: string
 }
 
 /** Uploaded car models are normalised to about this length (metres). */
 const TARGET_CAR_LENGTH = 4.5
 /** At most this many library slots. */
 const MAX_CAR_TYPES = 50
+/** A car brakes for the player once they're this close ahead (metres). */
+const BRAKE_DISTANCE = 7
 
 const BODY_COLORS: [number, number, number][] = [
   [0.82, 0.24, 0.22], // red
@@ -116,6 +123,9 @@ export class TrafficSystem {
   private count = 8 // generated (box) cars
   private speed = 9 // metres per second
   private playing = false
+
+  /** The on-foot player's ground position; cars stop for it when it's ahead. */
+  private blocker: { x: number; z: number } | null = null
 
   private bodyMats: StandardMaterial[] = []
   private wheelMat!: StandardMaterial
@@ -235,6 +245,8 @@ export class TrafficSystem {
       template: loaded.node,
       longest: loaded.longest,
       flip: false,
+      url,
+      ext: ext ?? '.glb',
     })
     this.rebuildCars()
     return id
@@ -340,7 +352,10 @@ export class TrafficSystem {
     for (const car of this.cars) {
       const lane = car.lane
       if (lane.total <= 0) continue
-      const moved = this.speed * car.speedMul * dt
+      let moved = this.speed * car.speedMul * dt
+      // Yield to the player: if they're standing in the road ahead of this car,
+      // it brakes to a stop rather than driving through them — GTA-style.
+      if (this.blocker && this.isBlockedAhead(car)) moved = 0
       car.s = (car.s + moved) % lane.total
       if (car.s < 0) car.s += lane.total
 
@@ -350,6 +365,78 @@ export class TrafficSystem {
       car.spin += moved / car.wheelRadius
       for (const w of car.wheels) w.rotation.x = car.spin
     }
+  }
+
+  /** Is the blocker close and within this car's forward cone? */
+  private isBlockedAhead(car: Car): boolean {
+    if (!this.blocker) return false
+    // Sample the car's current position and tangent without advancing it.
+    this.sampleLane(car.lane, car.s)
+    let fx = this._tan.x
+    let fz = this._tan.z
+    const fl = Math.hypot(fx, fz) || 1
+    fx /= fl
+    fz /= fl
+    if (car.flip) {
+      fx = -fx
+      fz = -fz
+    }
+    const dx = this.blocker.x - this._pos.x
+    const dz = this.blocker.z - this._pos.z
+    const dist = Math.hypot(dx, dz)
+    if (dist > BRAKE_DISTANCE || dist < 1e-3) return dist <= BRAKE_DISTANCE
+    // Ahead means the player is within a forward cone, not behind or beside.
+    const fdot = (dx * fx + dz * fz) / dist
+    return fdot > 0.45
+  }
+
+  /** Set (or clear, with null) the on-foot player's ground position. */
+  setBlocker(x: number | null, z = 0): void {
+    this.blocker = x === null ? null : { x, z }
+  }
+
+  /**
+   * The nearest hijackable (library-model) car within `maxDist` of a point, or
+   * null. Returns what a caller needs to swap the player vehicle to that model,
+   * plus a despawn() to remove the NPC car once it's been stolen.
+   */
+  nearestHijackable(
+    x: number,
+    z: number,
+    maxDist: number,
+  ): { url: string; name: string; ext: string; x: number; z: number; yaw: number; despawn: () => void } | null {
+    let best: Car | null = null
+    let bestD = maxDist
+    for (const car of this.cars) {
+      if (!car.source) continue
+      const p = car.holder.position
+      const d = Math.hypot(p.x - x, p.z - z)
+      if (d < bestD) {
+        bestD = d
+        best = car
+      }
+    }
+    if (!best || !best.source) return null
+    const p = best.holder.position
+    const q = best.holder.rotationQuaternion
+    let yaw = 0
+    if (q) yaw = Math.atan2(2 * (q.x * q.z + q.w * q.y), 1 - 2 * (q.x * q.x + q.y * q.y))
+    const target = best
+    return {
+      url: best.source.url,
+      name: best.source.name,
+      ext: best.source.ext,
+      x: p.x,
+      z: p.z,
+      yaw,
+      despawn: () => this.despawnCar(target),
+    }
+  }
+
+  private despawnCar(car: Car): void {
+    const i = this.cars.indexOf(car)
+    if (i >= 0) this.cars.splice(i, 1)
+    this.disposeCar(car)
   }
 
   /** Seat a car on its lane at its current arc-length — position and heading. */
@@ -495,6 +582,7 @@ export class TrafficSystem {
       wheelRadius: 0.38,
       spin: 0,
       flip: type.flip,
+      source: { url: type.url, name: type.name, ext: type.ext },
     }
   }
 
