@@ -48,7 +48,7 @@ phoenix/
 Status: `▢ planned  ◐ in progress  ✅ done & tested`
 
 0. ✅ **Architecture** — 9 subsystem design docs (`docs/`, ~7,000 lines)
-1. ◐ **Foundation** — monorepo dirs done; shared types + docker-compose next
+1. ✅ **Foundation** — monorepo, per-service Dockerfiles, docker-compose *(config validated)*, Makefile
 2. ✅ **Map Editor (web)** — terrain sculpt, water, gas circle, object/spawn/loot
    placement, `.phxmap` save/load *(verified headlessly)*
 3. ✅ **Auth service** — register/login/me, JWT + bcrypt *(7 tests green)*
