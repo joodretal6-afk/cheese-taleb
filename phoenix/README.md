@@ -52,7 +52,7 @@ Status: `▢ planned  ◐ in progress  ✅ done & tested`
 2. ✅ **Map Editor (web)** — terrain sculpt, water, gas circle, object/spawn/loot
    placement, `.phxmap` save/load *(verified headlessly)*
 3. ✅ **Auth service** — register/login/me, JWT + bcrypt *(7 tests green)*
-4. ◐ **Player Profile** ✅ *(9 tests)* · **Inventory** ▢
+4. ✅ **Player Profile** *(9 tests)* · ✅ **Inventory + Wallet** *(7 tests)*
 5. ▢ **Admin Dashboard** — wired to the live services
 6. ▢ **Matchmaking + Dedicated server contract**
 7. ▢ **Store / Economy / Battle Pass**
