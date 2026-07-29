@@ -55,7 +55,7 @@ Status: `▢ planned  ◐ in progress  ✅ done & tested`
 4. ✅ **Player Profile** *(9 tests)* · ✅ **Inventory + Wallet** *(7 tests)*
 5. ✅ **Admin Dashboard** — overview/players/leaderboard/economy *(verified)*
 6. ◐ **Matchmaking** ✅ *(10 tests)* · Dedicated-server contract ▢
-7. ▢ **Store / Economy / Battle Pass**
+7. ✅ **Store + Battle Pass** — catalogue, purchase saga, tier claims *(11 tests)*
 8. 🔵 **UE5 client** — character, weapons, vehicles, networking (dev-machine build)
 9. ▢ **LiveOps, analytics, security/anti-cheat, DevOps hardening**
 

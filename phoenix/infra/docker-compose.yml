@@ -71,5 +71,14 @@ services:
     depends_on:
       redis: { condition: service_healthy }
 
+  store:
+    build: ../services/store
+    environment:
+      PORT: 4005
+      DATABASE_URL: postgres://phoenix:phoenix@postgres:5432/phoenix
+    ports: ['4005:4005']
+    depends_on:
+      postgres: { condition: service_healthy }
+
 volumes:
   pgdata:
