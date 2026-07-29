@@ -1,0 +1,7 @@
+# UE5 generated
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+.vs/
+*.sln

@@ -1,6 +1,8 @@
 import {
   Color3,
+  ImportMeshAsync,
   Matrix,
+  Mesh,
   MeshBuilder,
   Quaternion,
   StandardMaterial,
@@ -8,9 +10,10 @@ import {
   Vector3,
   type AbstractMesh,
   type LinesMesh,
-  type Mesh,
   type Scene,
 } from '@babylonjs/core'
+import '@babylonjs/loaders/glTF'
+import { DEFAULT_WHEEL_HINTS } from '../VehicleModel'
 
 /**
  * Traffic.
@@ -25,14 +28,17 @@ import {
  * ring road and it never has a visible seam; draw a straight line and the car
  * runs it there-and-back.
  *
- * Everything hugs the terrain: each frame a car's height comes from the field,
- * its heading from the path tangent, and its tilt from the ground normal, so it
- * leans into slopes instead of clipping through them. The wheels roll by the
- * real distance covered, so they never look frozen.
+ * Everything sits on its wheels: each frame the ground is sampled under the
+ * four corners of the wheelbase, and the car's height and tilt come from that
+ * footprint — so it rests on a real four-point contact, follows slopes, and
+ * never sinks a corner into a dip. The wheels roll by the real distance
+ * covered, and the front pair steers toward the path ahead, so a turning car
+ * turns its wheels.
  *
- * The cars are generated meshes — a body, a cabin, four rolling wheels — not
- * downloaded assets, so a fleet of sixty costs nothing to load. Materials are a
- * shared palette; only the geometry is cloned per car.
+ * The generated cars are meshes — a body, a cabin, four rolling wheels. An
+ * uploaded library model is cloned per car and its wheels are found by name and
+ * wrapped so they roll and steer too. Materials are a shared palette; only the
+ * geometry is cloned per car, so a fleet of sixty costs nothing to load.
  *
  * The whole thing is self-contained: it reaches the world only through the
  * scene it draws into and a getter for the current mud field, so a world
@@ -55,19 +61,85 @@ interface Lane {
   markers: Mesh[]
 }
 
+/**
+ * A wheel we drive ourselves: a node at the wheel's centre that we roll (about
+ * the axle) and, for the front pair, steer (about vertical).
+ */
+interface ManagedWheel {
+  node: TransformNode
+  /** World radius, so roll = distance / radius. */
+  radius: number
+  /** Front wheels steer; rear wheels only roll. */
+  front: boolean
+}
+
 interface Car {
   holder: TransformNode
-  wheels: TransformNode[]
+  wheels: ManagedWheel[]
   meshes: AbstractMesh[]
   lane: Lane
   /** Arc-length position along the lane. */
   s: number
   /** Per-car speed multiplier, so a fleet does not move in lockstep. */
   speedMul: number
-  wheelRadius: number
-  /** Accumulated wheel spin, radians. */
-  spin: number
+  /** Distance travelled, drives wheel roll. */
+  dist: number
+  /** Smoothed steering angle of the front wheels, radians. */
+  steer: number
+  /** Half the car's length and width in world units, for the ground fit. */
+  halfLen: number
+  halfWid: number
+  /** A model whose front points the wrong way is turned 180° here. */
+  flip: boolean
+  /** Present on library-model cars: what's needed to hijack and drive it. */
+  source?: { url: string; name: string; ext: string }
 }
+
+/** One entry in the car library: an uploaded model and how many to spawn. */
+interface CarType {
+  id: string
+  name: string
+  count: number
+  /** The loaded, base-seated template cloned per car. */
+  template: TransformNode
+  /** Longest horizontal side of the template, for scaling to a car length. */
+  longest: number
+  /** Template-space full size along x/z, for the ground-fit footprint. */
+  sizeX: number
+  sizeZ: number
+  /** How many wheel meshes were found by name (0 = none roll). */
+  wheelsDetected: number
+  /** Front points the wrong way? Turn every car of this type around. */
+  flip: boolean
+  /** The GLB URL/ext this was loaded from, so a hijack can drive it. */
+  url: string
+  ext: string
+}
+
+/**
+ * Ready-made cars that ship with the app, offered in the panel and (the two
+ * clean ones) loaded by default in place of the generated boxes. `wheels` marks
+ * whether the model names its wheels so they visibly spin.
+ */
+export const BUILTIN_CARS: { key: string; name: string; url: string; wheels: boolean; def: boolean; note?: string }[] = [
+  { key: 'sedan', name: 'سيدان', url: 'models/us_sedan.glb', wheels: true, def: true },
+  { key: 'taxi', name: 'تاكسي', url: 'models/us_taxi.glb', wheels: true, def: true },
+  { key: 'uspolice', name: 'شرطة', url: 'models/us_police.glb', wheels: true, def: true },
+  { key: 'crownvic', name: 'شرطة (Crown Vic)', url: 'models/police_car.glb', wheels: true, def: false },
+  { key: 'mercedes', name: 'مرسيدس W201', url: 'models/mercedes_w201.glb', wheels: false, def: false, note: 'عجل مدموج بالجسم' },
+  { key: 'alfa', name: 'ألفا روميو 1967', url: 'models/alfa_romeo_1967.glb', wheels: false, def: false, note: 'عجل مدموج / منخفضة' },
+  { key: 'audi', name: 'أودي TT 2003', url: 'models/audi_tt.glb', wheels: false, def: false, note: 'عجل مدموج' },
+  { key: 'pack', name: 'باقة سيارات', url: 'models/car_pack_1.glb', wheels: true, def: false, note: 'عدة سيارات بملف' },
+]
+
+/** Uploaded car models are normalised to about this length (metres). */
+const TARGET_CAR_LENGTH = 4.5
+/** At most this many library slots. */
+const MAX_CAR_TYPES = 50
+/** A car brakes for the player once they're this close ahead (metres). */
+const BRAKE_DISTANCE = 7
+/** Peak steering angle of the front wheels, radians (~31°). */
+const MAX_STEER = 0.55
 
 const BODY_COLORS: [number, number, number][] = [
   [0.82, 0.24, 0.22], // red
@@ -88,9 +160,17 @@ export class TrafficSystem {
   private active: Lane | null = null
   private readonly cars: Car[] = []
 
-  private count = 8
+  /** The car library: uploaded models keyed by id. */
+  private readonly models = new Map<string, CarType>()
+  /** Guards the one-time load of the default built-in cars. */
+  private defaultsLoaded = false
+
+  private count = 8 // generated (box) cars
   private speed = 9 // metres per second
   private playing = false
+
+  /** The on-foot player's ground position; cars stop for it when it's ahead. */
+  private blocker: { x: number; z: number } | null = null
 
   private bodyMats: StandardMaterial[] = []
   private wheelMat!: StandardMaterial
@@ -99,7 +179,6 @@ export class TrafficSystem {
   private seq = 0
 
   // Scratch, reused every frame to avoid per-car allocation.
-  private readonly _n = { x: 0, y: 1, z: 0 }
   private readonly _pos = new Vector3()
   private readonly _tan = new Vector3()
   private readonly _basis = Matrix.Identity()
@@ -190,6 +269,83 @@ export class TrafficSystem {
     return this.speed
   }
 
+  // ------------------------------------------------------------- car library
+
+  /**
+   * Add an uploaded GLB as a car type. Loads it once into a template that is
+   * cloned per car, normalised so its longest side is about a car length and
+   * re-seated so its wheels sit on the ground. Returns the type id, or null on
+   * a failed load or when the library is full.
+   */
+  async addModel(url: string, name: string, ext?: string): Promise<string | null> {
+    if (this.models.size >= MAX_CAR_TYPES) return null
+    const loaded = await this.loadTemplate(url, ext)
+    if (!loaded) return null
+    const id = `carType_${this.seq++}`
+    this.models.set(id, {
+      id,
+      name: name || `طراز ${this.models.size + 1}`,
+      count: 3,
+      template: loaded.node,
+      longest: loaded.longest,
+      sizeX: loaded.sizeX,
+      sizeZ: loaded.sizeZ,
+      wheelsDetected: loaded.wheels,
+      flip: false,
+      url,
+      ext: ext ?? '.glb',
+    })
+    this.rebuildCars()
+    return id
+  }
+
+  /**
+   * Load the default ready-made cars once (the clean, correctly-sized ones) and
+   * drop the generated box cars to zero, so the traffic is real cars out of the
+   * box. Safe to call repeatedly — it only runs the first time.
+   */
+  async loadDefaults(): Promise<void> {
+    if (this.defaultsLoaded) return
+    this.defaultsLoaded = true
+    this.count = 0 // real cars replace the boxes
+    for (const b of BUILTIN_CARS.filter((c) => c.def)) {
+      const id = await this.addModel(b.url, b.name, '.glb')
+      if (id) this.setModelCount(id, 2)
+    }
+  }
+
+  setModelCount(id: string, n: number): void {
+    const t = this.models.get(id)
+    if (!t) return
+    t.count = Math.max(0, Math.min(50, Math.round(n)))
+    this.rebuildCars()
+  }
+
+  setModelFlip(id: string, flip: boolean): void {
+    const t = this.models.get(id)
+    if (!t) return
+    t.flip = flip
+    this.rebuildCars()
+  }
+
+  removeModel(id: string): void {
+    const t = this.models.get(id)
+    if (!t) return
+    t.template.dispose()
+    this.models.delete(id)
+    this.rebuildCars()
+  }
+
+  listModels(): { id: string; name: string; count: number; flip: boolean; wheels: number }[] {
+    return [...this.models.values()].map((t) => ({
+      id: t.id,
+      name: t.name,
+      count: t.count,
+      flip: t.flip,
+      wheels: t.wheelsDetected,
+    }))
+  }
+
   play(): void {
     this.playing = this.lanes.length > 0
   }
@@ -259,42 +415,164 @@ export class TrafficSystem {
     for (const car of this.cars) {
       const lane = car.lane
       if (lane.total <= 0) continue
-      const moved = this.speed * car.speedMul * dt
+      let moved = this.speed * car.speedMul * dt
+      // Yield to the player: if they're standing in the road ahead of this car,
+      // it brakes to a stop rather than driving through them — GTA-style.
+      if (this.blocker && this.isBlockedAhead(car)) moved = 0
       car.s = (car.s + moved) % lane.total
       if (car.s < 0) car.s += lane.total
+      car.dist += moved
 
       this.placeCar(car, field)
 
-      // Roll the wheels by the real distance covered.
-      car.spin += moved / car.wheelRadius
-      for (const w of car.wheels) w.rotation.x = car.spin
+      // Steering: compare the current travel heading with the path direction a
+      // few metres ahead. A drawn path is piecewise-straight, so a per-frame
+      // heading delta would only twitch at the corners; looking ahead gives a
+      // steady, natural steer through the whole curve.
+      this.sampleLane(car.lane, car.s)
+      const cx = this._pos.x
+      const cz = this._pos.z
+      const curHeading = Math.atan2(this._tan.x, this._tan.z)
+      const look = Math.min(lane.total * 0.24, Math.max(3, car.halfLen * 2.5))
+      this.sampleLane(car.lane, (car.s + look) % lane.total)
+      const desired = Math.atan2(this._pos.x - cx, this._pos.z - cz)
+      let d = desired - curHeading
+      while (d > Math.PI) d -= 2 * Math.PI
+      while (d < -Math.PI) d += 2 * Math.PI
+      const steerTarget = Math.max(-MAX_STEER, Math.min(MAX_STEER, d * 0.9))
+      car.steer += (steerTarget - car.steer) * Math.min(1, dt * 6)
+
+      // Roll every wheel by the real distance; steer the front pair.
+      for (const w of car.wheels) {
+        const roll = car.dist / w.radius
+        const steer = w.front ? car.steer : 0
+        if (!w.node.rotationQuaternion) w.node.rotationQuaternion = new Quaternion()
+        Quaternion.RotationYawPitchRollToRef(steer, roll, 0, w.node.rotationQuaternion)
+      }
     }
   }
 
-  /** Seat a car on its lane at its current arc-length — position and heading. */
+  /** Is the blocker close and within this car's forward cone? */
+  private isBlockedAhead(car: Car): boolean {
+    if (!this.blocker) return false
+    // Sample the car's current position and tangent without advancing it.
+    this.sampleLane(car.lane, car.s)
+    let fx = this._tan.x
+    let fz = this._tan.z
+    const fl = Math.hypot(fx, fz) || 1
+    fx /= fl
+    fz /= fl
+    if (car.flip) {
+      fx = -fx
+      fz = -fz
+    }
+    const dx = this.blocker.x - this._pos.x
+    const dz = this.blocker.z - this._pos.z
+    const dist = Math.hypot(dx, dz)
+    if (dist > BRAKE_DISTANCE || dist < 1e-3) return dist <= BRAKE_DISTANCE
+    // Ahead means the player is within a forward cone, not behind or beside.
+    const fdot = (dx * fx + dz * fz) / dist
+    return fdot > 0.45
+  }
+
+  /** Set (or clear, with null) the on-foot player's ground position. */
+  setBlocker(x: number | null, z = 0): void {
+    this.blocker = x === null ? null : { x, z }
+  }
+
+  /**
+   * The nearest hijackable (library-model) car within `maxDist` of a point, or
+   * null. Returns what a caller needs to swap the player vehicle to that model,
+   * plus a despawn() to remove the NPC car once it's been stolen.
+   */
+  nearestHijackable(
+    x: number,
+    z: number,
+    maxDist: number,
+  ): { url: string; name: string; ext: string; x: number; z: number; yaw: number; despawn: () => void } | null {
+    let best: Car | null = null
+    let bestD = maxDist
+    for (const car of this.cars) {
+      if (!car.source) continue
+      const p = car.holder.position
+      const d = Math.hypot(p.x - x, p.z - z)
+      if (d < bestD) {
+        bestD = d
+        best = car
+      }
+    }
+    if (!best || !best.source) return null
+    const p = best.holder.position
+    const q = best.holder.rotationQuaternion
+    let yaw = 0
+    if (q) yaw = Math.atan2(2 * (q.x * q.z + q.w * q.y), 1 - 2 * (q.x * q.x + q.y * q.y))
+    const target = best
+    return {
+      url: best.source.url,
+      name: best.source.name,
+      ext: best.source.ext,
+      x: p.x,
+      z: p.z,
+      yaw,
+      despawn: () => this.despawnCar(target),
+    }
+  }
+
+  private despawnCar(car: Car): void {
+    const i = this.cars.indexOf(car)
+    if (i >= 0) this.cars.splice(i, 1)
+    this.disposeCar(car)
+  }
+
+  /**
+   * Seat a car on its lane at its current arc-length. The height and tilt come
+   * from sampling the terrain under the four wheels (a footprint fit), not a
+   * single centre point — so the car rests on its wheels, follows slopes like a
+   * real car, and never sinks a corner into a dip.
+   */
   private placeCar(car: Car, field: NonNullable<ReturnType<TrafficSystem['getField']>>): void {
     this.sampleLane(car.lane, car.s)
-    const gx = this._pos.x
-    const gz = this._pos.z
-    const gy = field.surfaceHeight(gx, gz)
+    const cx = this._pos.x
+    const cz = this._pos.z
 
-    // Heading from the path tangent, tilt from the ground normal.
-    field.normalAt(gx, gz, this._n)
-    const up = new Vector3(this._n.x, this._n.y, this._n.z)
-    if (up.lengthSquared() < 1e-6) up.set(0, 1, 0)
+    // Travel forward on the plane, and the right vector beside it.
+    let fx = this._tan.x
+    let fz = this._tan.z
+    const fl = Math.hypot(fx, fz) || 1
+    fx /= fl
+    fz /= fl
+    if (car.flip) {
+      fx = -fx
+      fz = -fz
+    }
+    const rx = fz
+    const rz = -fx
+
+    // Sample the ground under the four corners of the wheelbase.
+    const L = car.halfLen
+    const W = car.halfWid
+    const cornerH = (a: number, b: number) =>
+      field.surfaceHeight(cx + fx * a * L + rx * b * W, cz + fz * a * L + rz * b * W)
+    const hFR = cornerH(1, 1)
+    const hFL = cornerH(1, -1)
+    const hRR = cornerH(-1, 1)
+    const hRL = cornerH(-1, -1)
+    const centreH = (hFR + hFL + hRR + hRL) * 0.25
+
+    // Forward and right tilt from the height differences across the footprint.
+    const forward = new Vector3(2 * L * fx, (hFR + hFL) * 0.5 - (hRR + hRL) * 0.5, 2 * L * fz)
+    forward.normalize()
+    const rightV = new Vector3(2 * W * rx, (hFR + hRR) * 0.5 - (hFL + hRL) * 0.5, 2 * W * rz)
+    rightV.normalize()
+    const up = Vector3.Cross(forward, rightV)
+    if (up.y < 0) up.negateInPlace()
     up.normalize()
-    let fwd = new Vector3(this._tan.x, 0, this._tan.z)
-    if (fwd.lengthSquared() < 1e-9) fwd.set(0, 0, 1)
-    fwd.normalize()
-    // Re-orthogonalise forward against the slope's up so the car sits flat.
-    const right = Vector3.Cross(up, fwd)
+    // Re-orthonormalise so the basis is clean.
+    const right = Vector3.Cross(up, forward)
     right.normalize()
-    fwd = Vector3.Cross(right, up)
+    const fwd = Vector3.Cross(right, up)
     fwd.normalize()
 
-    // Build the rotation directly from the basis: the car's body runs along its
-    // local +Z, so mapping local X→right, Y→up, Z→forward points it down the
-    // path. (Row i of a Babylon matrix is the image of local axis i.)
     if (!car.holder.rotationQuaternion) car.holder.rotationQuaternion = new Quaternion()
     Matrix.FromValuesToRef(
       right.x, right.y, right.z, 0,
@@ -304,7 +582,7 @@ export class TrafficSystem {
       this._basis,
     )
     Quaternion.FromRotationMatrixToRef(this._basis, car.holder.rotationQuaternion)
-    car.holder.position.set(gx, gy, gz)
+    car.holder.position.set(cx, centreH, cz)
   }
 
   // ---------------------------------------------------------------- geometry
@@ -347,19 +625,29 @@ export class TrafficSystem {
     this.cars.length = 0
 
     const usable = this.lanes.filter((l) => l.total > 1e-3)
-    if (usable.length === 0 || this.count === 0) {
-      if (this.cars.length === 0) this.playing = this.playing && usable.length > 0
+    if (usable.length === 0) {
+      this.playing = false
       return
     }
 
-    // Spread the fleet round-robin across lanes, then evenly along each lane.
+    // One factory per car to spawn: the generated box cars first, then every
+    // library model repeated by its own count. Flattening to a single list lets
+    // the whole mixed fleet spread evenly across the lanes together.
+    const factories: ((lane: Lane, idx: number) => Car)[] = []
+    for (let i = 0; i < this.count; i++) factories.push((lane, idx) => this.buildCar(lane, idx))
+    for (const t of this.models.values()) {
+      for (let i = 0; i < t.count; i++) factories.push((lane) => this.buildModelCar(lane, t))
+    }
+    if (factories.length === 0) return
+
     const perLane: Car[][] = usable.map(() => [])
-    for (let i = 0; i < this.count; i++) {
+    factories.forEach((make, i) => {
       const lane = usable[i % usable.length]
-      const car = this.buildCar(lane, i)
+      const car = make(lane, i)
       this.cars.push(car)
       perLane[i % usable.length].push(car)
-    }
+    })
+
     const field = this.field
     for (let li = 0; li < usable.length; li++) {
       const group = perLane[li]
@@ -373,6 +661,98 @@ export class TrafficSystem {
     }
   }
 
+  /** A car cloned from an uploaded library model, with its wheels made to spin. */
+  private buildModelCar(lane: Lane, type: CarType): Car {
+    const id = this.seq++
+    const holder = new TransformNode(`traffic_car_${id}`, this.scene)
+    holder.rotationQuaternion = new Quaternion()
+
+    const meshes: AbstractMesh[] = []
+    const clone = type.template.clone(`traffic_modelgeo_${id}`, holder)
+    const scale = TARGET_CAR_LENGTH / type.longest
+
+    const wheels: ManagedWheel[] = []
+    let wbLen = (type.sizeZ / 2) * 0.7
+    let wbWid = (type.sizeX / 2) * 0.85
+    if (clone) {
+      clone.setEnabled(true)
+      for (const m of clone.getChildMeshes()) {
+        m.isPickable = false
+        meshes.push(m)
+      }
+      if (clone instanceof Mesh) meshes.push(clone)
+
+      // Find the wheel meshes by name and wrap each in a node at its centre, so
+      // we can roll it about its axle and steer the front pair.
+      holder.computeWorldMatrix(true)
+      const found = this.detectWheels(holder)
+      for (const w of found) {
+        const container = new TransformNode(`traffic_wheel_${id}_${wheels.length}`, this.scene)
+        container.parent = holder
+        container.position.copyFrom(w.centerLocal)
+        container.rotationQuaternion = new Quaternion()
+        w.mesh.setParent(container)
+        w.mesh.isPickable = false
+        const front = type.flip ? w.centerLocal.z < 0 : w.centerLocal.z > 0
+        wheels.push({ node: container, radius: Math.max(0.05, w.radiusLocal * scale), front })
+      }
+      // Fit the ground footprint to the real wheels when we found them.
+      if (found.length) {
+        wbLen = Math.max(...found.map((w) => Math.abs(w.centerLocal.z))) || wbLen
+        wbWid = Math.max(...found.map((w) => Math.abs(w.centerLocal.x))) || wbWid
+      }
+    }
+    // Normalise to a car length; the template already sits with its base on y=0.
+    holder.scaling.setAll(scale)
+
+    return {
+      holder,
+      wheels,
+      meshes,
+      lane,
+      s: 0,
+      speedMul: 0.82 + Math.random() * 0.4,
+      dist: 0,
+      steer: 0,
+      halfLen: Math.max(0.6, wbLen * scale),
+      halfWid: Math.max(0.4, wbWid * scale),
+      flip: type.flip,
+      source: { url: type.url, name: type.name, ext: type.ext },
+    }
+  }
+
+  /**
+   * Find the wheel meshes of a just-cloned model (holder at identity, scale 1),
+   * returning each with its centre in holder-local space and its radius. A hint
+   * must sit at a word boundary, so "rim" no longer matches "pRIMitive" (glTF
+   * exporters split meshes into "…_primitiveN") — that bug spun the whole car —
+   * and the steering wheel is excluded so only the road wheels turn.
+   */
+  private detectWheels(
+    holder: TransformNode,
+  ): { mesh: AbstractMesh; centerLocal: Vector3; radiusLocal: number }[] {
+    const hints = DEFAULT_WHEEL_HINTS.map((h) => h.toLowerCase())
+    const wheelRe = new RegExp(`(?:^|[^a-z])(?:${hints.join('|')})`)
+    const out: { mesh: AbstractMesh; centerLocal: Vector3; radiusLocal: number }[] = []
+    for (const m of holder.getChildMeshes()) {
+      const name = m.name.toLowerCase()
+      if (name.includes('steering') || name.includes('spare')) continue
+      if (!wheelRe.test(name)) continue
+      if (!m.getTotalVertices?.()) continue
+      m.computeWorldMatrix(true)
+      const bb = m.getBoundingInfo().boundingBox
+      const min = bb.minimumWorld
+      const max = bb.maximumWorld
+      const center = new Vector3((min.x + max.x) / 2, (min.y + max.y) / 2, (min.z + max.z) / 2)
+      // A wheel on the ground is as tall as it is round, so its vertical extent
+      // is its diameter — this stays right whether the mesh is one wheel or a
+      // combined back axle (which is wide but no taller).
+      const radius = Math.max(0.05, (max.y - min.y) / 2)
+      out.push({ mesh: m, centerLocal: center, radiusLocal: radius })
+    }
+    return out
+  }
+
   private buildCar(lane: Lane, index: number): Car {
     const id = this.seq++
     const holder = new TransformNode(`traffic_car_${id}`, this.scene)
@@ -380,7 +760,7 @@ export class TrafficSystem {
 
     const wheelRadius = 0.38
     const meshes: AbstractMesh[] = []
-    const wheels: TransformNode[] = []
+    const wheels: ManagedWheel[] = []
 
     const bodyMat = this.bodyMats[index % this.bodyMats.length]
 
@@ -421,6 +801,7 @@ export class TrafficSystem {
       const pivot = new TransformNode(`traffic_wheelpivot_${id}_${sx}_${sz}`, this.scene)
       pivot.parent = holder
       pivot.position.set(sx, wheelRadius, sz)
+      pivot.rotationQuaternion = new Quaternion()
       const wheel = MeshBuilder.CreateCylinder(
         `traffic_wheel_${id}_${sx}_${sz}`,
         { diameter: wheelRadius * 2, height: 0.26, tessellation: 14 },
@@ -432,7 +813,7 @@ export class TrafficSystem {
       wheel.parent = pivot
       wheel.isPickable = false
       meshes.push(wheel)
-      wheels.push(pivot)
+      wheels.push({ node: pivot, radius: wheelRadius, front: sz > 0 })
     }
 
     return {
@@ -442,8 +823,58 @@ export class TrafficSystem {
       lane,
       s: 0,
       speedMul: 0.82 + Math.random() * 0.4,
-      wheelRadius,
-      spin: 0,
+      dist: 0,
+      steer: 0,
+      halfLen: 1.6,
+      halfWid: 0.9,
+      flip: false,
+    }
+  }
+
+  /**
+   * Load a GLB into a template node: drop the loader's handedness root, measure
+   * the footprint, and re-seat so the model is centred on x/z with its base on
+   * y = 0 — so a clone placed at a ground point stands on it. Mirrors the
+   * brush's model loader.
+   */
+  private async loadTemplate(
+    url: string,
+    ext?: string,
+  ): Promise<{ node: TransformNode; longest: number; sizeX: number; sizeZ: number; wheels: number } | null> {
+    try {
+      const result = await ImportMeshAsync(url, this.scene, { pluginExtension: ext })
+      const meshes = result.meshes.filter(
+        (m): m is Mesh => m instanceof Mesh && !!m.getTotalVertices(),
+      )
+      if (meshes.length === 0) {
+        for (const m of result.meshes) m.dispose()
+        return null
+      }
+      const template = new TransformNode(`carTemplate_${this.seq++}`, this.scene)
+      for (const m of meshes) m.setParent(template)
+      for (const m of result.meshes) if (m.name === '__root__') m.dispose()
+      template.computeWorldMatrix(true)
+
+      const min = new Vector3(Infinity, Infinity, Infinity)
+      const max = new Vector3(-Infinity, -Infinity, -Infinity)
+      for (const m of meshes) {
+        m.computeWorldMatrix(true)
+        const bb = m.getBoundingInfo().boundingBox
+        min.minimizeInPlace(bb.minimumWorld)
+        max.maximizeInPlace(bb.maximumWorld)
+      }
+      for (const m of meshes) {
+        m.position.subtractInPlace(new Vector3((min.x + max.x) / 2, min.y, (min.z + max.z) / 2))
+      }
+      const sizeX = max.x - min.x
+      const sizeZ = max.z - min.z
+      const longest = Math.max(0.01, Math.max(sizeX, sizeZ))
+      const wheels = this.detectWheels(template).length
+      template.setEnabled(false)
+      return { node: template, longest, sizeX, sizeZ, wheels }
+    } catch (err) {
+      console.error('[traffic] could not load car model', url, err)
+      return null
     }
   }
 
@@ -520,7 +951,7 @@ export class TrafficSystem {
 
   private disposeCar(car: Car): void {
     for (const m of car.meshes) m.dispose()
-    for (const w of car.wheels) w.dispose()
+    for (const w of car.wheels) w.node.dispose()
     car.holder.dispose()
   }
 
@@ -535,6 +966,8 @@ export class TrafficSystem {
     this.cancelLane()
     for (const l of this.lanes) this.disposeLane(l)
     this.lanes.length = 0
+    for (const t of this.models.values()) t.template.dispose()
+    this.models.clear()
     for (const m of this.bodyMats) m.dispose()
     this.wheelMat?.dispose()
     this.glassMat?.dispose()

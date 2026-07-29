@@ -1,0 +1,84 @@
+# Project Phoenix — local backend stack.
+#
+#   docker compose -f phoenix/infra/docker-compose.yml up --build
+#
+# Brings up all four microservices plus PostgreSQL and Redis. The services run
+# on in-memory stores today; DATABASE_URL / REDIS_URL are wired now so swapping
+# in the Postgres repositories needs no compose change.
+
+name: phoenix
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: phoenix
+      POSTGRES_PASSWORD: phoenix
+      POSTGRES_DB: phoenix
+    ports: ['5432:5432']
+    volumes: ['pgdata:/var/lib/postgresql/data']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U phoenix']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ['6379:6379']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  auth:
+    build: ../services/auth
+    environment:
+      PORT: 4001
+      JWT_SECRET: change-me-in-prod
+      DATABASE_URL: postgres://phoenix:phoenix@postgres:5432/phoenix
+      REDIS_URL: redis://redis:6379
+    ports: ['4001:4001']
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  profile:
+    build: ../services/profile
+    environment:
+      PORT: 4002
+      DATABASE_URL: postgres://phoenix:phoenix@postgres:5432/phoenix
+    ports: ['4002:4002']
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  inventory:
+    build: ../services/inventory
+    environment:
+      PORT: 4003
+      DATABASE_URL: postgres://phoenix:phoenix@postgres:5432/phoenix
+    ports: ['4003:4003']
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  matchmaking:
+    build: ../services/matchmaking
+    environment:
+      PORT: 4004
+      REDIS_URL: redis://redis:6379
+    ports: ['4004:4004']
+    depends_on:
+      redis: { condition: service_healthy }
+
+  store:
+    build: ../services/store
+    environment:
+      PORT: 4005
+      DATABASE_URL: postgres://phoenix:phoenix@postgres:5432/phoenix
+    ports: ['4005:4005']
+    depends_on:
+      postgres: { condition: service_healthy }
+
+volumes:
+  pgdata:

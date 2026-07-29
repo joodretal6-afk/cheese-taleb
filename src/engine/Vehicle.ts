@@ -724,8 +724,12 @@ export class Vehicle {
     }
   }
 
-  /** Drop the truck back at the spawn point, upright and stationary. */
-  reset(at?: Vector3) {
+  /**
+   * Drop the truck back at the spawn point, upright and stationary. An optional
+   * `yaw` (radians about +Y) orients it — used when a hijacked car should keep
+   * the heading of the NPC car it replaced.
+   */
+  reset(at?: Vector3, yaw = 0) {
     const p = at ?? this.spawn
     const he = this.model.halfExtents
     let top = -Infinity
@@ -736,7 +740,8 @@ export class Vehicle {
     }
     const y = top + this.wheels[0].rig.radius + 0.36
     this.body.setTranslation({ x: p.x, y, z: p.z }, true)
-    this.body.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true)
+    // Yaw-only quaternion about +Y: (0, sin(yaw/2), 0, cos(yaw/2)).
+    this.body.setRotation({ x: 0, y: Math.sin(yaw / 2), z: 0, w: Math.cos(yaw / 2) }, true)
     this.body.setLinvel({ x: 0, y: 0, z: 0 }, true)
     this.body.setAngvel({ x: 0, y: 0, z: 0 }, true)
     this.body.resetForces(true)

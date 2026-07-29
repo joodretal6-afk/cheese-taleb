@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Sim } from '../engine/Sim'
+import { KhalidiyaRoad } from '../engine/scene/KhalidiyaRoad'
 import { useSim } from '../store/simStore'
 
 /**
@@ -33,6 +34,14 @@ export function Viewport({ children }: { children?: React.ReactNode }) {
       const sim = new Sim(canvas)
       simRef.current = sim
       ;(window as unknown as { sim: Sim }).sim = sim
+      // Dev helper: build/clear the Khalidiya scene from the console or a
+      // headless screenshot run without clicking through the tools panel.
+      ;(window as unknown as { __khalidiya: (on?: boolean) => void }).__khalidiya = (on = true) => {
+        const s = sim as unknown as { khalidiyaRoad?: KhalidiyaRoad }
+        if (!s.khalidiyaRoad) s.khalidiyaRoad = new KhalidiyaRoad(sim as never)
+        if (on) s.khalidiyaRoad.build()
+        else s.khalidiyaRoad.clear()
+      }
 
       sim.boot().catch((err) => {
         console.error('[sim] boot failed', err)

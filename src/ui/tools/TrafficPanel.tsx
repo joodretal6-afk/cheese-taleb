@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { PointerEventTypes } from '@babylonjs/core'
 import { Panel } from '../Chrome'
-import { TrafficSystem } from '../../engine/traffic/TrafficSystem'
+import { TrafficSystem, BUILTIN_CARS } from '../../engine/traffic/TrafficSystem'
+import { EditorCamera } from '../../engine/EditorCamera'
 
 // The engine appears on window only after boot; reach it through this narrow
 // hole. Babylon subfields stay `any` on purpose — see the other tool panels.
@@ -9,10 +10,19 @@ type SimLike = {
   scene: any
   field: any
   traffic?: TrafficSystem
+  editorCam?: EditorCamera
+}
+
+type StoreLike = {
+  getState(): { settings: { running: boolean }; set(key: 'running', value: boolean): void }
 }
 
 function getSim(): SimLike | undefined {
   return (window as unknown as { sim?: SimLike }).sim
+}
+
+function getStore(): StoreLike | undefined {
+  return (window as unknown as { __simStore?: StoreLike }).__simStore
 }
 
 /**
@@ -29,6 +39,14 @@ function getTraffic(): TrafficSystem | undefined {
   return sim.traffic
 }
 
+/** The one shared editor camera, likewise stashed on the sim. */
+function getEditorCam(): EditorCamera | undefined {
+  const sim = getSim()
+  if (!sim) return undefined
+  if (!sim.editorCam) sim.editorCam = new EditorCamera(sim.scene)
+  return sim.editorCam
+}
+
 export function TrafficPanel() {
   const [drawing, setDrawing] = useState(false)
   const [activePts, setActivePts] = useState(0)
@@ -37,10 +55,19 @@ export function TrafficPanel() {
   const [speed, setSpeed] = useState(() => getTraffic()?.getSpeed() ?? 9)
   const [running, setRunning] = useState(false)
   const [cars, setCars] = useState(0)
+  const [editorCam, setEditorCam] = useState(false)
+  const [camSpeed, setCamSpeed] = useState(() => getEditorCam()?.getSpeed() ?? 24)
+  const [models, setModels] = useState<
+    { id: string; name: string; count: number; flip: boolean; wheels: number }[]
+  >([])
+  const [uploading, setUploading] = useState(false)
+  const [loadingDefaults, setLoadingDefaults] = useState(false)
 
   // Keep a live cursor into the traffic system without re-reading window each call.
   const sysRef = useRef<TrafficSystem | undefined>(undefined)
   sysRef.current = getTraffic()
+  // Remember the run state we paused when engaging the editor camera.
+  const prevRunning = useRef<boolean | null>(null)
 
   function sync() {
     const t = sysRef.current
@@ -50,6 +77,7 @@ export function TrafficPanel() {
     setRunning(t.running)
     setCars(t.carCount())
     setDrawing(t.drawing)
+    setModels(t.listModels())
   }
 
   // While drawing, each ground click drops a waypoint. Marching the field ray
@@ -62,6 +90,8 @@ export function TrafficPanel() {
     const scene = sim.scene
     const observer = scene.onPointerObservable.add((info: any) => {
       if (info.type !== PointerEventTypes.POINTERDOWN) return
+      // Left button only: the right button is the editor camera's look-drag.
+      if ((info.event?.button ?? 0) !== 0) return
       const p = t.pickGround(scene.pointerX, scene.pointerY)
       if (!p) return
       t.addWaypoint(p.x, p.z)
@@ -70,12 +100,62 @@ export function TrafficPanel() {
     return () => scene.onPointerObservable.remove(observer)
   }, [drawing])
 
+  // --- Editor camera ------------------------------------------------------
+  // Fly freely (right-drag to look, so left-click still draws), physics paused
+  // while it's on so WASD doesn't also drive the truck.
+  function enableEditorCam() {
+    const cam = getEditorCam()
+    if (!cam || cam.active) {
+      setEditorCam(true)
+      return
+    }
+    const store = getStore()
+    if (store) {
+      prevRunning.current = store.getState().settings.running
+      store.getState().set('running', false)
+    }
+    cam.enable({ lookButton: 2 })
+    setEditorCam(true)
+  }
+
+  function disableEditorCam() {
+    const cam = getEditorCam()
+    cam?.disable()
+    const store = getStore()
+    if (store && prevRunning.current !== null) {
+      store.getState().set('running', prevRunning.current)
+      prevRunning.current = null
+    }
+    setEditorCam(false)
+  }
+
+  function toggleEditorCam() {
+    if (getEditorCam()?.active) disableEditorCam()
+    else enableEditorCam()
+  }
+
+  function applyCamSpeed(v: number) {
+    setCamSpeed(v)
+    getEditorCam()?.setSpeed(v)
+  }
+
+  // Leaving the panel entirely shouldn't strand the camera in editor mode.
+  useEffect(() => {
+    return () => {
+      if (getEditorCam()?.active) disableEditorCam()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   function startDraw() {
     const t = sysRef.current
     if (!t) return
     t.beginLane()
     setDrawing(true)
     setActivePts(0)
+    // Drawing wants a free view — bring the editor camera up automatically so
+    // you can fly to any angle and keep left-clicking to place points.
+    if (!getEditorCam()?.active) enableEditorCam()
   }
 
   function finishDraw() {
@@ -121,6 +201,79 @@ export function TrafficPanel() {
     sysRef.current?.setSpeed(v)
   }
 
+  // --- Car library --------------------------------------------------------
+  function refreshModels() {
+    const t = sysRef.current
+    if (!t) return
+    setModels(t.listModels())
+    setCars(t.carCount())
+  }
+
+  async function uploadModel(file: File | undefined) {
+    const t = sysRef.current
+    if (!file || !t) return
+    setUploading(true)
+    try {
+      // A blob URL (not base64): a car GLB is megabytes and the loader reads a
+      // URL directly. The blob carries no extension, so pass it explicitly or
+      // Babylon can't pick the glTF loader.
+      const url = URL.createObjectURL(file)
+      const name = file.name.replace(/\.(glb|gltf)$/i, '')
+      const ext = /\.gltf$/i.test(file.name) ? '.gltf' : '.glb'
+      const id = await t.addModel(url, name, ext)
+      if (id) refreshModels()
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  function applyModelCount(id: string, n: number) {
+    const t = sysRef.current
+    if (!t) return
+    t.setModelCount(id, n)
+    refreshModels()
+  }
+
+  function toggleModelFlip(id: string, flip: boolean) {
+    sysRef.current?.setModelFlip(id, flip)
+    refreshModels()
+  }
+
+  function removeModel(id: string) {
+    sysRef.current?.removeModel(id)
+    refreshModels()
+  }
+
+  async function addBuiltin(b: (typeof BUILTIN_CARS)[number]) {
+    const t = sysRef.current
+    if (!t) return
+    setUploading(true)
+    try {
+      const id = await t.addModel(b.url, b.name, '.glb')
+      if (id) refreshModels()
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  // On first open, bring in the ready-made cars in place of the box cars.
+  useEffect(() => {
+    const t = sysRef.current
+    if (!t) return
+    let cancelled = false
+    setLoadingDefaults(true)
+    void t.loadDefaults().then(() => {
+      if (cancelled) return
+      setCount(t.getCount())
+      refreshModels()
+      setLoadingDefaults(false)
+    })
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   function togglePlay() {
     const t = sysRef.current
     if (!t) return
@@ -147,6 +300,42 @@ export function TrafficPanel() {
   return (
     <Panel title="المرور" className="min-w-0" bodyClassName="min-h-0 overflow-y-auto p-4">
       <div className="flex flex-col gap-4" dir="rtl">
+        {/* Editor camera -------------------------------------------------- */}
+        <div className="flex flex-col gap-2 rounded-lg border border-ink-700 bg-ink-900/40 p-2.5">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-[12px] font-medium text-mist-300">كاميرا المحرر</span>
+            <button
+              type="button"
+              className={editorCam ? btnActive : btn}
+              onClick={toggleEditorCam}
+            >
+              {editorCam ? 'مُفعّلة' : 'تفعيل'}
+            </button>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="w-20 shrink-0 text-[12px] text-mist-400">سرعة الكاميرا</span>
+            <input
+              type="range"
+              className="h-4 min-w-0 flex-1"
+              min={4}
+              max={120}
+              step={1}
+              value={camSpeed}
+              aria-label="سرعة الكاميرا"
+              onChange={(e) => applyCamSpeed(Number(e.target.value))}
+            />
+            <span className="w-10 shrink-0 text-end text-[12px] tabular-nums text-mist-300">
+              {camSpeed}
+            </span>
+          </div>
+          <p className="text-[11px] leading-4 text-mist-400">
+            حركة: <kbd className="rounded bg-ink-700 px-1 font-mono" dir="ltr">WASD</kbd> ·
+            ارتفاع <kbd className="rounded bg-ink-700 px-1 font-mono" dir="ltr">E/Q</kbd> ·
+            نظر بسحب <span className="text-mist-300">الزر الأيمن</span> ·
+            رسم بالزر الأيسر · تسريع <kbd className="rounded bg-ink-700 px-1 font-mono" dir="ltr">Shift</kbd>.
+          </p>
+        </div>
+
         {/* Draw a path ---------------------------------------------------- */}
         <div className="flex flex-col gap-2">
           <span className="text-[12px] font-medium text-mist-300">مسارات السيارات</span>
@@ -192,9 +381,9 @@ export function TrafficPanel() {
 
         <div className="h-px bg-ink-700" />
 
-        {/* Fleet size ----------------------------------------------------- */}
+        {/* Fleet size (generated cars) ------------------------------------ */}
         <div className="flex items-center gap-3">
-          <span className="w-20 shrink-0 text-[12px] text-mist-400">عدد السيارات</span>
+          <span className="w-24 shrink-0 text-[12px] text-mist-400">سيارات افتراضية</span>
           <input
             type="range"
             className="h-4 min-w-0 flex-1"
@@ -202,12 +391,122 @@ export function TrafficPanel() {
             max={60}
             step={1}
             value={count}
-            aria-label="عدد السيارات"
+            aria-label="عدد السيارات الافتراضية"
             onChange={(e) => applyCount(Number(e.target.value))}
           />
           <span className="w-10 shrink-0 text-end text-[12px] tabular-nums text-mist-300">
             {count}
           </span>
+        </div>
+
+        {/* Car library ---------------------------------------------------- */}
+        <div className="flex flex-col gap-2 rounded-lg border border-ink-700 bg-ink-900/40 p-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[12px] font-medium text-mist-300">
+              مكتبة السيارات
+              <span className="text-mist-500"> ({models.length}/50)</span>
+            </span>
+            <label
+              className={`cursor-pointer rounded-lg px-3 py-1.5 text-[12px] transition-colors ${
+                uploading ? 'bg-ink-700 text-mist-400' : 'bg-brand-500 text-white hover:bg-brand-400'
+              }`}
+            >
+              {uploading ? '…جارٍ' : '+ ارفع شكل'}
+              <input
+                type="file"
+                accept=".glb,.gltf,model/gltf-binary"
+                className="hidden"
+                disabled={uploading || models.length >= 50}
+                onChange={(e) => void uploadModel(e.target.files?.[0])}
+              />
+            </label>
+          </div>
+          {/* Ready-made cars that ship with the app. */}
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[11px] text-mist-400">
+              {loadingDefaults ? 'يجري تحميل السيارات الجاهزة…' : 'سيارات جاهزة (اضغط للإضافة):'}
+            </span>
+            <div className="flex flex-wrap gap-1.5">
+              {BUILTIN_CARS.map((b) => (
+                <button
+                  key={b.key}
+                  type="button"
+                  disabled={uploading || loadingDefaults}
+                  onClick={() => void addBuiltin(b)}
+                  title={b.note ?? (b.wheels ? 'عجالها تلف' : 'عجالها لا تلف (غير مسمّاة)')}
+                  className="rounded-md border border-ink-600 bg-ink-800 px-2 py-1 text-[11px] text-mist-200 transition-colors hover:bg-ink-700 disabled:opacity-40"
+                >
+                  + {b.name}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {models.length === 0 ? (
+            <p className="text-[11px] leading-4 text-mist-400">
+              السيارات الجاهزة أعلاه، أو ارفع ملف GLB خاص بك. حدّد كم سيارة من كل طراز.
+            </p>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {models.map((m) => (
+                <div key={m.id} className="flex flex-col gap-1.5 rounded-md border border-ink-700 bg-ink-850 p-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="flex min-w-0 flex-1 items-center gap-1.5">
+                      <span className="min-w-0 truncate text-[12px] text-mist-200" title={m.name}>
+                        {m.name}
+                      </span>
+                      <span
+                        className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${
+                          m.wheels > 0
+                            ? 'bg-emerald-500/15 text-emerald-400'
+                            : 'bg-ink-700 text-mist-400'
+                        }`}
+                        title={
+                          m.wheels > 0
+                            ? `تم العثور على ${m.wheels} عجل — تلفّ وتنعطف`
+                            : 'لم يُعثر على عجل بالاسم — سمِّ العجل wheel/tire في الملف لتلفّ'
+                        }
+                      >
+                        {m.wheels > 0 ? `عجل ✓ ${m.wheels}` : 'بلا عجل'}
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => removeModel(m.id)}
+                      className="shrink-0 text-[11px] text-mist-400 hover:text-red-400"
+                      title="حذف الطراز"
+                    >
+                      حذف
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="w-14 shrink-0 text-[11px] text-mist-400">العدد</span>
+                    <input
+                      type="range"
+                      className="h-4 min-w-0 flex-1"
+                      min={0}
+                      max={30}
+                      step={1}
+                      value={m.count}
+                      aria-label={`عدد ${m.name}`}
+                      onChange={(e) => applyModelCount(m.id, Number(e.target.value))}
+                    />
+                    <span className="w-8 shrink-0 text-end text-[11px] tabular-nums text-mist-300">
+                      {m.count}
+                    </span>
+                  </div>
+                  <label className="flex cursor-pointer items-center gap-2 text-[11px] text-mist-400">
+                    <input
+                      type="checkbox"
+                      checked={m.flip}
+                      onChange={(e) => toggleModelFlip(m.id, e.target.checked)}
+                    />
+                    اقلب الاتجاه (لو السيارة تسير للخلف)
+                  </label>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Speed ---------------------------------------------------------- */}
@@ -250,6 +549,19 @@ export function TrafficPanel() {
             ارسم مساراً واحداً على الأقل ثم شغّل الحركة.
           </p>
         )}
+
+        <div className="h-px bg-ink-700" />
+
+        {/* GTA-style hint ------------------------------------------------- */}
+        <div className="flex flex-col gap-1 rounded-lg border border-ink-700 bg-ink-900/40 p-2.5">
+          <span className="text-[12px] font-medium text-mist-300">القيادة والسرقة</span>
+          <p className="text-[11px] leading-4 text-mist-400">
+            وأنت راجل (اخرج من مركبتك بـ<kbd className="rounded bg-ink-700 px-1 font-mono" dir="ltr">F</kbd>)
+            السيارات تهدأ وتقف إذا وقفت أمامها. اقترب من سيارة من مكتبة الطُرز واضغط
+            <kbd className="mx-1 rounded bg-ink-700 px-1 font-mono" dir="ltr">F</kbd>
+            لتسرقها وتقودها. (السيارات الصندوقية للزينة فقط — الطُرز المرفوعة هي التي تُسرق.)
+          </p>
+        </div>
       </div>
     </Panel>
   )

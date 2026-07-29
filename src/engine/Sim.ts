@@ -65,6 +65,8 @@ const PHYSICS_DT = 1 / 120
 const MAX_SUBSTEPS = 5
 /** How close to the driver's door you must stand to get in, metres. */
 const ENTER_RANGE = 3.2
+/** How close to a passing traffic car you must stand to hijack it, metres. */
+const HIJACK_RANGE = 4.5
 
 /** What landscape the world is built on. */
 type WorldSpec =
@@ -111,6 +113,20 @@ export class Sim {
   painter!: Painter
   /** The baked neighbourhood, once one has been loaded. */
   region?: RegionScene
+  /**
+   * The traffic system, once the traffic panel has created it. Attached from
+   * the UI (kept on the sim so it survives panel unmounts); the loop uses it,
+   * when present, to let the player hijack a passing car and to make cars brake
+   * for the player on foot. Optional so nothing breaks if it was never opened.
+   */
+  traffic?: {
+    setBlocker(x: number | null, z?: number): void
+    nearestHijackable(
+      x: number,
+      z: number,
+      maxDist: number,
+    ): { url: string; name: string; ext: string; x: number; z: number; yaw: number; despawn: () => void } | null
+  }
   /** Which car is being driven. Every physics number comes from here. */
   vehicleSpec: VehicleSpec = getVehicle(DEFAULT_VEHICLE_ID)
   /** GLBs the user uploaded this session, keyed by generated id. */
@@ -1056,6 +1072,34 @@ export class Sim {
     return Math.atan2(fwd.x, fwd.z)
   }
 
+  /**
+   * Steal a passing traffic car: swap the player vehicle to that car's model,
+   * drop it where the car was (keeping its heading), remove the NPC car, and
+   * get in. GTA-style. Kicked off from the loop when the player presses enter on
+   * foot next to a hijackable car; runs async while the model loads, so the
+   * character just stands until the swap lands a frame or two later.
+   */
+  private hijacking = false
+  private async hijackNearbyCar(): Promise<void> {
+    if (this.hijacking || !this.traffic) return
+    const p = this.character.position
+    const car = this.traffic.nearestHijackable(p.x, p.z, HIJACK_RANGE)
+    if (!car) return
+    this.hijacking = true
+    try {
+      const id = await this.addCustomVehicle(car.url, car.name, car.ext)
+      if (!id) return
+      // Drop the freshly-swapped vehicle onto the car's spot, facing its way.
+      this.vehicle.reset(new Vector3(car.x, 0, car.z), car.yaw)
+      car.despawn()
+      this.character.setEnabled(false)
+      this.mode = 'driving'
+      this.camSnap = true
+    } finally {
+      this.hijacking = false
+    }
+  }
+
   // -------------------------------------------------------------------- loop
 
   private tick() {
@@ -1069,9 +1113,20 @@ export class Sim {
 
     this.input.update(dt)
     if (this.input.consumePress('KeyR')) this.vehicle.reset()
-    if (settings.running && this.input.consumePress('KeyF')) this.toggleVehicle()
+    if (settings.running && this.input.consumePress('KeyF')) {
+      // F gets into the player's own vehicle when beside it; otherwise, on foot,
+      // it hijacks the nearest passing traffic car.
+      const changed = this.toggleVehicle()
+      if (!changed && this.mode === 'onfoot') void this.hijackNearbyCar()
+    }
 
     const onFoot = this.mode === 'onfoot'
+
+    // Let traffic cars brake for the player while they're on foot in the road.
+    if (this.traffic) {
+      if (onFoot) this.traffic.setBlocker(this.character.position.x, this.character.position.z)
+      else this.traffic.setBlocker(null)
+    }
 
     if (settings.running) {
       this.accumulator += dt
