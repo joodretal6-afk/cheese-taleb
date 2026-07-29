@@ -33,6 +33,10 @@ export interface PhxMapMeta {
   grid: number
   /** Maps stored height values (metres) onto the world. */
   heightRange: { min: number; max: number }
+  /** Sea/water plane height in metres (undefined = no water). */
+  water?: { level: number }
+  /** Initial safe-zone / gas circle preview. */
+  gas?: { x: number; z: number; radius: number }
 }
 
 export interface PhxMap {
@@ -50,6 +54,8 @@ export function createEmptyMap(name = 'untitled', grid = 256, worldSizeMeters = 
       worldSizeMeters,
       grid,
       heightRange: { min: -50, max: 600 },
+      water: { level: -8 },
+      gas: { x: 0, z: 0, radius: worldSizeMeters * 0.35 },
     },
     heights: new Array(grid * grid).fill(0),
     objects: [],

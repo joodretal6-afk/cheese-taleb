@@ -56,16 +56,29 @@ try {
     }
     // Smooth pass
     for (const [x, z] of hills) for (let k = 0; k < 6; k++) t.sculpt(x, z, 'smooth', 220, 1)
+
+    // Raise the sea so the valley floods, then scatter objects.
+    ed.setWaterLevel(-2)
+    const H = (x, z) => t.heightAt(x, z)
+    const rnd = (a, b) => a + Math.random() * (b - a)
+    for (let i = 0; i < 60; i++) { const x = rnd(-900, 900), z = rnd(-900, 900); ed.objects.add('tree', x, H(x, z), z) }
+    for (let i = 0; i < 14; i++) { const x = rnd(-400, 400), z = rnd(-400, 400); ed.objects.add('building', x, H(x, z), z) }
+    for (let i = 0; i < 10; i++) { const x = rnd(-800, 800), z = rnd(-800, 800); ed.objects.add('rock', x, H(x, z), z) }
+    for (let i = 0; i < 8; i++) { const x = rnd(-700, 700), z = rnd(-700, 700); ed.objects.add('loot', x, H(x, z), z) }
+    for (let i = 0; i < 6; i++) { const x = rnd(-600, 600), z = rnd(-600, 600); ed.objects.add('spawn', x, H(x, z), z) }
+    for (let i = 0; i < 4; i++) { const x = rnd(-500, 500), z = rnd(-500, 500); ed.objects.add('vehicle', x, H(x, z), z) }
+    ed.setGasRadius(650)
+
     // Frame the camera a bit lower for a nicer angle
-    ed.camera.beta = 1.15
+    ed.camera.beta = 1.12
     ed.camera.alpha = -Math.PI / 2 + 0.5
-    ed.camera.radius = 2400
+    ed.camera.radius = 2500
     ed.scene.render()
-    return { verts: t.grid * t.grid, hills: hills.length }
+    return { verts: t.grid * t.grid, hills: hills.length, objects: ed.objectCount() }
   })
   await page.waitForTimeout(2500)
   await page.screenshot({ path: out, timeout: 120000, animations: 'disabled' })
-  logs.push(`[info] sculpted ${info.hills} hills over ${info.verts} verts`)
+  logs.push(`[info] sculpted ${info.hills} hills over ${info.verts} verts, placed ${info.objects} objects`)
 } catch (err) {
   status = 'error'
   logs.push(`[fatal] ${err.message}`)
