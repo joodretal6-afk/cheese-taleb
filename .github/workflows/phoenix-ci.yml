@@ -1,0 +1,52 @@
+name: Phoenix CI
+
+on:
+  push:
+    paths: ['phoenix/**', '.github/workflows/phoenix-ci.yml']
+  pull_request:
+    paths: ['phoenix/**', '.github/workflows/phoenix-ci.yml']
+
+jobs:
+  services:
+    name: service · ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [auth, profile, inventory, matchmaking, store]
+    defaults:
+      run:
+        working-directory: phoenix/services/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+
+  web:
+    name: web · ${{ matrix.app }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [editor, admin]
+    defaults:
+      run:
+        working-directory: phoenix/${{ matrix.app }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --no-audit --no-fund
+      - run: npm run typecheck
+
+  compose:
+    name: docker-compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose -f phoenix/infra/docker-compose.yml config --quiet

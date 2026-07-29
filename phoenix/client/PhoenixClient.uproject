@@ -1,0 +1,17 @@
+{
+  "FileVersion": 3,
+  "EngineAssociation": "5.6",
+  "Category": "Game",
+  "Description": "Project Phoenix — mobile battle-royale client",
+  "Modules": [
+    {
+      "Name": "PhoenixClient",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "Plugins": [
+    { "Name": "OnlineSubsystem", "Enabled": true },
+    { "Name": "EnhancedInput", "Enabled": true }
+  ]
+}

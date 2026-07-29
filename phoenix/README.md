@@ -56,8 +56,8 @@ Status: `▢ planned  ◐ in progress  ✅ done & tested`
 5. ✅ **Admin Dashboard** — overview/players/leaderboard/economy *(verified)*
 6. ✅ **Matchmaking + dedicated-server contract** *(13 tests)*
 7. ✅ **Store + Battle Pass** — catalogue, purchase saga, tier claims *(11 tests)*
-8. 🔵 **UE5 client** — character, weapons, vehicles, networking (dev-machine build)
-9. ▢ **LiveOps, analytics, security/anti-cheat, DevOps hardening**
+8. 🔵 **UE5 client** — starter: auth bridge, character + enter-vehicle, game mode, setup + Blueprint guides *(compiles on your machine)*
+9. ◐ **DevOps** — GitHub Actions CI (all 47 tests + typechecks + compose) ✅ · LiveOps/anti-cheat ▢
 
 Each module lands with: working code, tests, its own README, and (for services)
 a runnable `docker-compose` slice.
