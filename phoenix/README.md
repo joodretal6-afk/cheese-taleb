@@ -47,10 +47,12 @@ phoenix/
 
 Status: `▢ planned  ◐ in progress  ✅ done & tested`
 
-1. ▢ **Foundation** — monorepo, shared types, config, DB schema, docker-compose
-2. ▢ **Map Editor (web)** — terrain/water/roads/props/spawns → exportable map file
-3. ▢ **Auth service** — accounts, JWT/OAuth, sessions
-4. ▢ **Player Profile + Inventory services**
+0. ✅ **Architecture** — 9 subsystem design docs (`docs/`, ~7,000 lines)
+1. ◐ **Foundation** — monorepo dirs done; shared types + docker-compose next
+2. ✅ **Map Editor (web)** — terrain sculpt, water, gas circle, object/spawn/loot
+   placement, `.phxmap` save/load *(verified headlessly)*
+3. ✅ **Auth service** — register/login/me, JWT + bcrypt *(7 tests green)*
+4. ◐ **Player Profile** ✅ *(9 tests)* · **Inventory** ▢
 5. ▢ **Admin Dashboard** — wired to the live services
 6. ▢ **Matchmaking + Dedicated server contract**
 7. ▢ **Store / Economy / Battle Pass**
