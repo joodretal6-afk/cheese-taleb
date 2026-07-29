@@ -53,7 +53,7 @@ Status: `▢ planned  ◐ in progress  ✅ done & tested`
    placement, `.phxmap` save/load *(verified headlessly)*
 3. ✅ **Auth service** — register/login/me, JWT + bcrypt *(7 tests green)*
 4. ✅ **Player Profile** *(9 tests)* · ✅ **Inventory + Wallet** *(7 tests)*
-5. ▢ **Admin Dashboard** — wired to the live services
+5. ✅ **Admin Dashboard** — overview/players/leaderboard/economy *(verified)*
 6. ▢ **Matchmaking + Dedicated server contract**
 7. ▢ **Store / Economy / Battle Pass**
 8. 🔵 **UE5 client** — character, weapons, vehicles, networking (dev-machine build)
